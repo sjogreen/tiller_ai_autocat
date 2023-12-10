@@ -4,7 +4,7 @@ Apps Script code to use Open AI to automatically categorize financial transactio
 ## About
 - This is a script that is desined to work with the Tiller finance product to automatically categorize and clean up the Description column of your transactions (so you don't have to do it all manually!).
 - It will only touch transactions that don't have a Category set.
-- It works by trying to find how you've previously categorized transactions like the one it's working, sending those to Open AI, and asking it to do it's magic.  It will set the Category and Description field based on what comes back.
+- It works by trying to find how you've previously categorized transactions like the one it's working on, sending those to Open AI, and asking it to do it's magic.  It will set the Category and Description field based on what comes back.
 - It will pick the best valid category from your Category list, or fall back to a category you specify if it gets confused.
 - If you want to mark transactions that have been modified by this code, add a column to your Transactions sheet called "AI AutoCat" - it will mark transactions it's modified by writing TRUE into this column.
 - This works for me, and I've tried to make it somewhat generic so it works for others -- but I DISCLAIM ALL RESPONSBILITY IF IT MESSES ANYTHING UP IN YOUR SHEET.  You can always undo or revert to a previous version.
