@@ -267,7 +267,7 @@ function lookupDescAndCategory (transactionList, categoryList, model='gpt-4-1106
               If you know of a merchant it might be referring to, use the name of that merchant for the suggested description.\n\
             (b) Keep the suggested description as simple as possible. Remove punctuation, extraneous \
               numbers, location information, abbreviations such as "Inc." or "LLC", IDs and account numbers.\n\
-            (2) For each original_description, suggest a “category” for the transaction from the allowed_categories list that will be provided.\n\
+            (2) For each original_description, suggest a “category” for the transaction from the allowed_categories list that was provided.\n\
             (3) If you are not confident in the suggested category after using your own knowledge and the previous transactions provided, use the cateogry "' + FALLBACK_CATEGORY + '"\n\n\
             (4) Your response should be a JSON object and no other text.  The response object should be of the form:\n\
             {"suggested_transactions": [\
