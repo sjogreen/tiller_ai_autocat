@@ -88,17 +88,37 @@ function findSimilarTransactions(originalDescription) {
   matchString = matchString.replace('xx', '#');
 
   // Strip numbers at end
-  descriptionParts = matchString.split('#');
+  var descriptionParts = matchString.split('#');
   matchString = descriptionParts[0];
 
   // Remove unimportant words
-  matchString = matchString.replace('direct debit', '');
-  matchString = matchString.replace('direct deposit', '');
-  matchString = matchString.replace('zelle payment from', '');
-  matchString = matchString.replace('bill payment', '');
+  matchString = matchString.replace('direct debit ', '');
+  matchString = matchString.replace('direct deposit ', '');
+  matchString = matchString.replace('zelle payment from ', '');
+  matchString = matchString.replace('bill payment ', '');
+  matchString = matchString.replace('dividend received ', '');
   matchString = matchString.replace('sq *', '');
+  matchString = matchString.replace('sq*', '');
   matchString = matchString.replace('tst *', '');
+  matchString = matchString.replace('tst*', '');
   matchString = matchString.replace('in *', '');
+  matchString = matchString.replace('in*', '');
+  matchString = matchString.replace('tcb *', '');
+  matchString = matchString.replace('tcb*', '');
+  matchString = matchString.replace('dd *', '');
+  matchString = matchString.replace('dd*', '');
+  matchString = matchString.replace('py *', '');
+  matchString = matchString.replace('py*', '');
+  matchString = matchString.replace('p *', '');
+  matchString = matchString.replace('pp*', '');
+  matchString = matchString.replace('rx *', '');
+  matchString = matchString.replace('rx*', '');
+
+  // Split words on * character
+  matchString = matchString.replace('*', ' ');
+
+  // Trim leading & trailing spaces
+  matchString = matchString.trim();
 
   // Grab first 3 words
   descriptionParts = matchString.split(' ');
@@ -119,6 +139,8 @@ function findSimilarTransactions(originalDescription) {
                     origDescColLetter + ") contains \"" + matchString + "\" OR lower(" + descColLetter +
                     ") contains \"" + matchString + "\") ORDER BY " + dateColLetter +" DESC LIMIT 3";
 
+  Logger.log("Looking for previous transactions with query: " + queryString);
+  
   var result = Utils.gvizQuery(
       SpreadsheetApp.getActiveSpreadsheet().getId(), 
       queryString, 
