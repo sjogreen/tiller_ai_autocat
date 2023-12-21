@@ -10,6 +10,9 @@ Apps Script code to use Open AI to automatically categorize financial transactio
 - This works for me, and I've tried to make it somewhat generic so it works for others -- but I DISCLAIM ALL RESPONSBILITY IF IT MESSES ANYTHING UP IN YOUR SHEET.  You can always undo or revert to a previous version.
 - Given how sensitive this is to data, any and all feedback about how it's working (or not) is greatly appreciated.
 
+## Demo Video
+- You can see this working with some sample data here: https://drive.google.com/file/d/16ROtqWboSOaNfgKGs0hUSjc3heGqFPBD/view?usp=drive_link
+
 ## Installation Instructions
 - First, you need to get an Open AI API Key to use.  Sign up as a developer with Open AI and get a secret key.
 - From your Tiller connected Google Sheet, go to Extensions --> Apps Script
