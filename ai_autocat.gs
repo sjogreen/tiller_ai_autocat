@@ -1,5 +1,5 @@
 // API Keys
-const OPENAI_API_KEY = 'YOUR KEY HERE';
+const OPENAI_API_KEY = 'YOUR_API_KEY_HERE';
 
 // Sheet Names
 const TRANSACTION_SHEET_NAME = 'Transactions';
@@ -49,11 +49,13 @@ function categorizeUncategorizedTransactions() {
 
   var updatedTransactions = lookupDescAndCategory(transactionList, categoryList);
 
-  Logger.log("Open AI returned the following sugested categories and descriptions:");
-  Logger.log(updatedTransactions);
-  Logger.log("Writing updated transactions into your sheet...");
-  writeUpdatedTransactions(updatedTransactions, categoryList);
-  Logger.log("Finished updating your sheet!");
+  if (updatedTransactions != null) {
+    Logger.log("Open AI returned the following sugested categories and descriptions:");
+    Logger.log(updatedTransactions);
+    Logger.log("Writing updated transactions into your sheet...");
+    writeUpdatedTransactions(updatedTransactions, categoryList);
+    Logger.log("Finished updating your sheet!");
+  }
 }
 
 // Gets all transactions that have an original description but no category set
@@ -97,6 +99,7 @@ function findSimilarTransactions(originalDescription) {
   matchString = matchString.replace('zelle payment from ', '');
   matchString = matchString.replace('bill payment ', '');
   matchString = matchString.replace('dividend received ', '');
+  matchString = matchString.replace('debit card purchase ', '');
   matchString = matchString.replace('sq *', '');
   matchString = matchString.replace('sq*', '');
   matchString = matchString.replace('tst *', '');
@@ -113,12 +116,19 @@ function findSimilarTransactions(originalDescription) {
   matchString = matchString.replace('pp*', '');
   matchString = matchString.replace('rx *', '');
   matchString = matchString.replace('rx*', '');
+  matchString = matchString.replace('intuit *', '');
+  matchString = matchString.replace('intuit*', '');
+  matchString = matchString.replace('microsoft *', '');
+  matchString = matchString.replace('microsoft*', '');
 
   // Split words on * character
   matchString = matchString.replace('*', ' ');
 
   // Trim leading & trailing spaces
   matchString = matchString.trim();
+
+  // Trim double spaces
+  matchString = matchString.replace(/\s{2,}/g, ' ');
 
   // Grab first 3 words
   descriptionParts = matchString.split(' ');
@@ -317,8 +327,15 @@ function lookupDescAndCategory (transactionList, categoryList, model='gpt-4-1106
     muteHttpExceptions: true,
   };
 
-  var response = UrlFetchApp.fetch("https://api.openai.com/v1/chat/completions", options);
-  var results = JSON.parse(JSON.parse(response.getContentText())["choices"][0]["message"]["content"])
+  var response = UrlFetchApp.fetch("https://api.openai.com/v1/chat/completions", options).getContentText();
+  var parsedResponse = JSON.parse(response);
 
-  return results["suggested_transactions"];
+  if ("error" in parsedResponse) {
+    Logger.log("Error from Open AI: " + parsedResponse["error"]["message"]);
+
+    return null;
+  } else {
+    var apiResponse = JSON.parse(parsedResponse["choices"][0]["message"]["content"]);
+    return apiResponse["suggested_transactions"];
+  }
 }
