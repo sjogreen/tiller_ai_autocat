@@ -121,9 +121,6 @@ function findSimilarTransactions(originalDescription) {
   matchString = matchString.replace('microsoft *', '');
   matchString = matchString.replace('microsoft*', '');
 
-  // Split words on * character
-  matchString = matchString.replace('*', ' ');
-
   // Trim leading & trailing spaces
   matchString = matchString.trim();
 
