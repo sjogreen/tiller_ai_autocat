@@ -71,7 +71,6 @@ function getTransactionsToCategorize() {
   var queryString = "SELECT " + txnIDColLetter + ", " + origDescColLetter + " WHERE " + origDescColLetter +
                     " is not null AND " + categoryColLetter + " is null LIMIT " + MAX_BATCH_SIZE;
 
-
   var uncategorizedTransactions = Utils.gvizQuery(
       SpreadsheetApp.getActiveSpreadsheet().getId(), 
       queryString, 
@@ -245,14 +244,18 @@ function getAllowedCategories() {
 }
 
 function getColumnLetterFromColumnHeader(columnHeaders, columnName) {
-  var colIndex = columnHeaders.indexOf(columnName);
-  var colLetter = null;
+  var columnIndex = columnHeaders.indexOf(columnName);
+  var columnLetter = "";
 
-  if (colIndex > -1) {
-    colLetter = String.fromCharCode(('A'.charCodeAt(0) + colIndex));
-  }
+    let base = 26;
+    let letterCharCodeBase = 'A'.charCodeAt(0);
 
-  return colLetter;
+    while (columnIndex >= 0) {
+        columnLetter = String.fromCharCode(columnIndex % base + letterCharCodeBase) + columnLetter;
+        columnIndex = Math.floor(columnIndex / base) - 1;
+    }
+
+    return columnLetter;
 }
 
 function lookupDescAndCategory (transactionList, categoryList, model='gpt-4-1106-preview') {
