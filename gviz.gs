@@ -13,7 +13,7 @@
      * @param        {Number} headers Header rows.                              [OPTIONAL]
      */
     Utils.gvizQuery = function(ssId, query, sheetId, range, headers) {
-        var response = JSON.parse( UrlFetchApp
+        var rawResponse = UrlFetchApp
                 .fetch(
                     Utilities.formatString(
                         "https://docs.google.com/spreadsheets/d/%s/gviz/tq?tq=%s%s%s%s",
@@ -35,9 +35,12 @@
                 .getContentText()
                 .replace("/*O_o*/\n", "") // remove JSONP wrapper
                 .replace(/(google\.visualization\.Query\.setResponse\()|(\);)/gm, "") // remove JSONP wrapper
-            ),
-            table = response.table,
-            rows;
+
+        Logger.log("Response from Query: " + rawResponse);
+        var response = JSON.parse(rawResponse);
+
+        var table = response.table;
+        var rows;
 
         if (typeof headers === "number") {
             rows = table.rows.map(function(row) {
