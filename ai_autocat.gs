@@ -1,5 +1,5 @@
 // API Keys
-const OPENAI_API_KEY = '';
+const OPENAI_API_KEY = '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';
 
 // Sheet Names
 const TRANSACTION_SHEET_NAME = 'Transactions';
@@ -47,8 +47,9 @@ function categorizeUncategorizedTransactions() {
 
     transactionList.push({
       'transaction_id': uncategorizedTransactions[i][0],
-      'original_description': uncategorizedTransactions[i][1],
-      'original_amount'     : uncategorizedTransactions[i][2],
+      'description'   : uncategorizedTransactions[i][1],
+      'amount'        : uncategorizedTransactions[i][2],
+      'account'       : uncategorizedTransactions[i][3],
       'previous_transactions': similarTransactions
     });
   }
@@ -78,10 +79,11 @@ function getTransactionsToCategorize() {
   var origDescColLetter = getColumnLetterFromColumnHeader(headers, ORIGINAL_DESCRIPTION_COL_NAME);
   var categoryColLetter = getColumnLetterFromColumnHeader(headers, CATEGORY_COL_NAME);
   var amountColLetter = getColumnLetterFromColumnHeader(headers, AMOUNT_COL_NAME);
+  var accountColLetter = getColumnLetterFromColumnHeader(headers, ACCOUNT_COL_NAME);
 
   var lastColLetter = getColumnLetterFromColumnHeader(headers, headers[headers.length - 1]);
 
-  var queryString = "SELECT " + txnIDColLetter + ", " + origDescColLetter + ", " +  amountColLetter + " WHERE " + origDescColLetter +
+  var queryString = "SELECT " + txnIDColLetter + ", " + origDescColLetter + ", " +  amountColLetter + ", " +  accountColLetter + " WHERE " + origDescColLetter +
                     " is not null AND " + categoryColLetter + " is null LIMIT " + MAX_BATCH_SIZE;
 
   var uncategorizedTransactions = Utils.gvizQuery(
@@ -168,14 +170,14 @@ function findSimilarTransactions(originalDescription, amountToMatch) {
 
   for (var w = 0; w < wordLoop; w++) {
     
-    descriptionWord = descriptionParts.slice(w, Math.min(1, descriptionParts.length))
-    matchString = descriptionParts.join(' ');
+    descriptionWord = descriptionParts[w]
+    matchString = descriptionWord;
 
     // Fetch Queries where you match on single word desc.
     var queryString = "SELECT " + descColLetter + ", " + categoryColLetter + ", " + origDescColLetter + ", " + tagColLetter + ", " + accountColLetter + ", " + amountColLetter +
                       " WHERE " + categoryColLetter + " is not null AND (lower(" + 
                       origDescColLetter + ") contains \"" + matchString + "\" OR lower(" + descColLetter +
-                      ") contains \"" + matchString + "\") ORDER BY " + dateColLetter +" DESC LIMIT 5";
+                      ") contains \"" + matchString + "\") ORDER BY " + dateColLetter +" DESC LIMIT 3";
   
     Logger.log("Looking for previous transactions with query: " + queryString);
     
@@ -203,7 +205,7 @@ function findSimilarTransactions(originalDescription, amountToMatch) {
   // Fetch Queries where you match on single word desc.
   // amountToMatch
   var queryString = "SELECT " + descColLetter + ", " + categoryColLetter + ", " + origDescColLetter + ", " + tagColLetter + ", " + accountColLetter + ", " + amountColLetter + 
-                    " WHERE " + categoryColLetter + " is not null AND " + amountColLetter + " = " + amountToMatch + " ORDER BY " + dateColLetter +" DESC LIMIT 5";
+                    " WHERE " + categoryColLetter + " is not null AND " + amountColLetter + " = " + amountToMatch + " ORDER BY " + dateColLetter +" DESC LIMIT 3";
 
 
   Logger.log("Looking for previous transactions with query: " + queryString);
@@ -389,7 +391,7 @@ function lookupDescAndCategory (transactionList, categoryList, model='gpt-4-1106
                 "transaction_id": "The unique ID previously provided for this transaction",\
                 "updated_description": "The cleaned up version of the description",\
                 "category": "A category selected from the allowed_categories list",\
-                "tags": "A comma seperated list of proposed tags from the No more than 2"\
+                "tags": "A comma seperated list of proposed tags from the No more than 2. all tags should be lowercase"\
               }\
             ]}'
       },
