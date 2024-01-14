@@ -1,5 +1,5 @@
 // API Keys
-const OPENAI_API_KEY = 'YOUR_API_KEY_HERE';
+const OPENAI_API_KEY = '';
 
 // Sheet Names
 const TRANSACTION_SHEET_NAME = 'Transactions';
@@ -10,14 +10,19 @@ const TRANSACTION_ID_COL_NAME = 'Transaction ID';
 const ORIGINAL_DESCRIPTION_COL_NAME = 'Full Description';
 const DESCRIPTION_COL_NAME = 'Description';
 const CATEGORY_COL_NAME = 'Category';
+const ACCOUNT_COL_NAME = 'Account';
+const AMOUNT_COL_NAME = 'Amount';
+
 const AI_AUTOCAT_COL_NAME = 'AI AutoCat'
+const TAGS_COL_NAME = 'Tags'
+
 const DATE_COL_NAME = 'Date';
 
 // Fallback Transaction Category (to be used when we don't know how to categorize a transaction)
-const FALLBACK_CATEGORY = "To Be Categorized";
+const FALLBACK_CATEGORY = "Uncategorized";
 
 // Other Misc Paramaters
-const MAX_BATCH_SIZE = 50;
+const MAX_BATCH_SIZE = 1;
 
 function categorizeUncategorizedTransactions() {
   var uncategorizedTransactions = getTransactionsToCategorize();
@@ -33,11 +38,17 @@ function categorizeUncategorizedTransactions() {
 
   var transactionList = []
   for (var i = 0; i < uncategorizedTransactions.length; i++) {
-    var similarTransactions = findSimilarTransactions(uncategorizedTransactions[i][1]);
+    Logger.log("uncategorizedTransactions:" + uncategorizedTransactions[i]);
+    Logger.log("uncategorizedTransactions:" + uncategorizedTransactions[i][1]);
+    Logger.log("uncategorizedTransactions:" + uncategorizedTransactions[i][2]);
+
+    // Passing Description and Amount for searching
+    var similarTransactions = findSimilarTransactions(uncategorizedTransactions[i][1], uncategorizedTransactions[i][2]);
 
     transactionList.push({
       'transaction_id': uncategorizedTransactions[i][0],
       'original_description': uncategorizedTransactions[i][1],
+      'original_amount'     : uncategorizedTransactions[i][2],
       'previous_transactions': similarTransactions
     });
   }
@@ -66,9 +77,11 @@ function getTransactionsToCategorize() {
   var txnIDColLetter = getColumnLetterFromColumnHeader(headers, TRANSACTION_ID_COL_NAME);
   var origDescColLetter = getColumnLetterFromColumnHeader(headers, ORIGINAL_DESCRIPTION_COL_NAME);
   var categoryColLetter = getColumnLetterFromColumnHeader(headers, CATEGORY_COL_NAME);
+  var amountColLetter = getColumnLetterFromColumnHeader(headers, AMOUNT_COL_NAME);
+
   var lastColLetter = getColumnLetterFromColumnHeader(headers, headers[headers.length - 1]);
 
-  var queryString = "SELECT " + txnIDColLetter + ", " + origDescColLetter + " WHERE " + origDescColLetter +
+  var queryString = "SELECT " + txnIDColLetter + ", " + origDescColLetter + ", " +  amountColLetter + " WHERE " + origDescColLetter +
                     " is not null AND " + categoryColLetter + " is null LIMIT " + MAX_BATCH_SIZE;
 
   var uncategorizedTransactions = Utils.gvizQuery(
@@ -81,7 +94,7 @@ function getTransactionsToCategorize() {
   return uncategorizedTransactions;
 }
 
-function findSimilarTransactions(originalDescription) {
+function findSimilarTransactions(originalDescription, amountToMatch) {
   // Normalize to lowercase
   var matchString = originalDescription.toLowerCase();
 
@@ -125,14 +138,18 @@ function findSimilarTransactions(originalDescription) {
   // Trim leading & trailing spaces
   matchString = matchString.trim();
 
+  // Remove funky char/letter combinations.  Lets keep just letters.
+  stringsOnly = matchString.match(/[a-zA-Z]+/g);
+  Logger.log("so:" + stringsOnly); // Or return matchString;
+  matchString = stringsOnly.join(' ');
+  Logger.log("ms:" +matchString); // Or return matchString;
+
   // Trim double spaces
   matchString = matchString.replace(/\s+/g, ' ');
 
   // Grab first 3 words
-  descriptionParts = matchString.split(' ');
-  descriptionParts = descriptionParts.slice(0, Math.min(3, descriptionParts.length))
-  matchString = descriptionParts.join(' ');
-
+  var previousTransactionList = [];
+  var runningCount =0;
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TRANSACTION_SHEET_NAME);
   var headers = sheet.getRange("1:1").getValues()[0];
 
@@ -140,15 +157,57 @@ function findSimilarTransactions(originalDescription) {
   var origDescColLetter = getColumnLetterFromColumnHeader(headers, ORIGINAL_DESCRIPTION_COL_NAME);
   var categoryColLetter = getColumnLetterFromColumnHeader(headers, CATEGORY_COL_NAME);
   var dateColLetter = getColumnLetterFromColumnHeader(headers, DATE_COL_NAME);
+
+  var tagColLetter = getColumnLetterFromColumnHeader(headers, TAGS_COL_NAME);
+  var accountColLetter = getColumnLetterFromColumnHeader(headers,ACCOUNT_COL_NAME);
+  var amountColLetter = getColumnLetterFromColumnHeader(headers,AMOUNT_COL_NAME);
   var lastColLetter = getColumnLetterFromColumnHeader(headers, headers[headers.length - 1]);
 
-  var queryString = "SELECT " + descColLetter + ", " + categoryColLetter + ", " + origDescColLetter + 
-                    " WHERE " + categoryColLetter + " is not null AND (lower(" + 
-                    origDescColLetter + ") contains \"" + matchString + "\" OR lower(" + descColLetter +
-                    ") contains \"" + matchString + "\") ORDER BY " + dateColLetter +" DESC LIMIT 3";
+  var descriptionParts = matchString.split(' ');
+  var wordLoop = Math.min(3, descriptionParts.length);
+
+  for (var w = 0; w < wordLoop; w++) {
+    
+    descriptionWord = descriptionParts.slice(w, Math.min(1, descriptionParts.length))
+    matchString = descriptionParts.join(' ');
+
+    // Fetch Queries where you match on single word desc.
+    var queryString = "SELECT " + descColLetter + ", " + categoryColLetter + ", " + origDescColLetter + ", " + tagColLetter + ", " + accountColLetter + ", " + amountColLetter +
+                      " WHERE " + categoryColLetter + " is not null AND (lower(" + 
+                      origDescColLetter + ") contains \"" + matchString + "\" OR lower(" + descColLetter +
+                      ") contains \"" + matchString + "\") ORDER BY " + dateColLetter +" DESC LIMIT 5";
+  
+    Logger.log("Looking for previous transactions with query: " + queryString);
+    
+    var result = Utils.gvizQuery(
+        SpreadsheetApp.getActiveSpreadsheet().getId(), 
+        queryString, 
+        TRANSACTION_SHEET_NAME,
+        "A:" + lastColLetter
+      );
+  
+
+    for (var i = 0; i < result.length; i++) {
+      previousTransactionList.push({
+        'original_description': result[i][2],
+        'updated_description': result[i][0],
+        'category': result[i][1],
+        'account': result[i][4],
+        'tags': result[i][3],
+        'amount': result[i][5]
+      });
+      runningCount += 1;
+    }
+  }
+  // Fetch Queries where you match on exact amount
+  // Fetch Queries where you match on single word desc.
+  // amountToMatch
+  var queryString = "SELECT " + descColLetter + ", " + categoryColLetter + ", " + origDescColLetter + ", " + tagColLetter + ", " + accountColLetter + ", " + amountColLetter + 
+                    " WHERE " + categoryColLetter + " is not null AND " + amountColLetter + " = " + amountToMatch + " ORDER BY " + dateColLetter +" DESC LIMIT 5";
+
 
   Logger.log("Looking for previous transactions with query: " + queryString);
-  
+    
   var result = Utils.gvizQuery(
       SpreadsheetApp.getActiveSpreadsheet().getId(), 
       queryString, 
@@ -156,14 +215,18 @@ function findSimilarTransactions(originalDescription) {
       "A:" + lastColLetter
     );
 
-  var previousTransactionList = []
   for (var i = 0; i < result.length; i++) {
     previousTransactionList.push({
       'original_description': result[i][2],
       'updated_description': result[i][0],
-      'category': result[i][1]
+      'category': result[i][1],
+      'account': result[i][4],
+      'tags': result[i][3],
+      'amount': result[i][5]
     });
+    runningCount += 1;
   }
+  Logger.log("Total number of related queries found: " + runningCount);
 
   return previousTransactionList;
 }
@@ -177,7 +240,10 @@ function writeUpdatedTransactions(transactionList, categoryList) {
   var descriptionColumnLetter = getColumnLetterFromColumnHeader(headers, DESCRIPTION_COL_NAME);
   var categoryColumnLetter = getColumnLetterFromColumnHeader(headers, CATEGORY_COL_NAME);
   var transactionIDColumnLetter = getColumnLetterFromColumnHeader(headers, TRANSACTION_ID_COL_NAME);
+  var tagsIDColumnLetter = getColumnLetterFromColumnHeader(headers, TAGS_COL_NAME);
+
   var openAIFlagColLetter = getColumnLetterFromColumnHeader(headers, AI_AUTOCAT_COL_NAME);
+  Logger.log("AI_AUTOCAT_COL_NAME: " + openAIFlagColLetter);
 
   for (var i = 0; i < transactionList.length; i++) {
     // Find Row of transaction
@@ -213,6 +279,17 @@ function writeUpdatedTransactions(transactionList, categoryList) {
       } catch (error) {
         Logger.log(error);
       }
+      // Set Updated Tags
+      var tagRangeString = tagsIDColumnLetter + transactionRow;
+
+      try {
+        var tagRange = sheet.getRange(tagRangeString);
+        tagRange.setValue(transactionList[i]["tags"]);
+      } catch (error) {
+        Logger.log(error);
+      }
+
+
 
       // Mark Open AI Flag
       if (openAIFlagColLetter != null) {
@@ -267,7 +344,7 @@ function lookupDescAndCategory (transactionList, categoryList, model='gpt-4-1106
 
   const request = {
     model: model,
-    temperature: 0.2,
+    temperature: 0.05,
     top_p: 0.1,
     seed: 1,
     response_format: {"type": "json_object"},
@@ -302,13 +379,17 @@ function lookupDescAndCategory (transactionList, categoryList, model='gpt-4-1106
             (b) Keep the suggested description as simple as possible. Remove punctuation, extraneous \
               numbers, location information, abbreviations such as "Inc." or "LLC", IDs and account numbers.\n\
             (2) For each original_description, suggest a “category” for the transaction from the allowed_categories list that was provided.\n\
+            (2a) Heavily weight previously categorized transactions is selecting new recommended category, and only if there is not a good suggestion then select a different category\n\
             (3) If you are not confident in the suggested category after using your own knowledge and the previous transactions provided, use the cateogry "' + FALLBACK_CATEGORY + '"\n\n\
-            (4) Your response should be a JSON object and no other text.  The response object should be of the form:\n\
+            (4) For tags, refer to the previous tags that were used and previous tags have the most weight.   You can use the list of the allowed_categories or general categories also.  Dont reuse the category that was selected. \
+            (4a) Heavily weight previously tagged transactions is selecting new recommended tags.\n\
+            (5) Your response should be a JSON object and no other text.  The response object should be of the form:\n\
             {"suggested_transactions": [\
               {\
                 "transaction_id": "The unique ID previously provided for this transaction",\
                 "updated_description": "The cleaned up version of the description",\
-                "category": "A category selected from the allowed_categories list"\
+                "category": "A category selected from the allowed_categories list",\
+                "tags": "A comma seperated list of proposed tags from the No more than 2"\
               }\
             ]}'
       },
