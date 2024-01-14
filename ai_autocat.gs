@@ -1,5 +1,5 @@
 // API Keys
-const OPENAI_API_KEY = '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';
+const OPENAI_API_KEY = '';
 
 // Sheet Names
 const TRANSACTION_SHEET_NAME = 'Transactions';
