@@ -8,6 +8,7 @@ Apps Script code to use Gemini or Open AI to automatically categorize financial 
 - It will pick the best valid category from your Category list, or fall back to a category you specify if it gets confused.
 - If you want to mark transactions that have been modified by this code, add a column to your Transactions sheet called "AI AutoCat" - it will mark transactions it's modified by writing TRUE into this column.
 - Given how sensitive this is to data, any and all feedback about how it's working (or not) is greatly appreciated.
+- Special thanks to @Aag1024 for adding gemini suppport and the tfidf search module which works a lot better than my hackery?
 
 ## Demo Video
 - You can see this working with some sample data here: https://drive.google.com/file/d/16ROtqWboSOaNfgKGs0hUSjc3heGqFPBD/view?usp=drive_link
