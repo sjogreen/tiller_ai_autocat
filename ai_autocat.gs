@@ -58,7 +58,7 @@ function categorizeUncategorizedTransactions() {
 
   var categoryList = getAllowedCategories();
 
-  var updateTransactions;
+  var updatedTransactions;
   if (AI_PROVIDER == 'gemini') {
     Logger.log(
       "Using Gemini"
