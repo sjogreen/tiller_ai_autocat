@@ -202,81 +202,94 @@ function findSimilarTransactions(originalDescription) {
   return previousTransactionList;
 }
 
+// MS new updated function - faster calls google servers only 2-3 times compared to 2-3 times per row that you need to fill
+
 function writeUpdatedTransactions(transactionList, categoryList) {
-  var sheet =
-    SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Transactions");
+var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Transactions");
 
-  // Get Column Numbers
-  var headers = sheet.getRange("1:1").getValues()[0];
+// --- STEP 1: Get All Column Indexes ---
+var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
-  var descriptionColumnLetter = getColumnLetterFromColumnHeader(
-    headers,
-    DESCRIPTION_COL_NAME
-  );
-  var categoryColumnLetter = getColumnLetterFromColumnHeader(
-    headers,
-    CATEGORY_COL_NAME
-  );
-  var transactionIDColumnLetter = getColumnLetterFromColumnHeader(
-    headers,
-    TRANSACTION_ID_COL_NAME
-  );
-  var openAIFlagColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    AI_AUTOCAT_COL_NAME
-  );
+// Helper to find index safely (returns -1 if not found)
+var idColIdx = headers.indexOf(TRANSACTION_ID_COL_NAME);
+var catColIdx = headers.indexOf(CATEGORY_COL_NAME);
+var descColIdx = headers.indexOf(DESCRIPTION_COL_NAME);
+var aiFlagColIdx = headers.indexOf(AI_AUTOCAT_COL_NAME); // Assuming you want to update the AI flag too
 
-  for (var i = 0; i < transactionList.length; i++) {
-    // Find Row of transaction
-    var transactionIDRange = sheet.getRange(
-      transactionIDColumnLetter + ":" + transactionIDColumnLetter
-    );
-    var textFinder = transactionIDRange.createTextFinder(
-      transactionList[i]["transaction_id"]
-    );
-    var match = textFinder.findNext();
-    if (match != null) {
-      var transactionRow = match.getRowIndex();
+if (idColIdx === -1 || catColIdx === -1) {
+Logger.log("Error: Critical columns not found. Check your header names.");
+return;
+}
 
-      // Set Updated Category
-      var categoryRangeString = categoryColumnLetter + transactionRow;
+// --- STEP 2: Read Data into Memory (Batch Read) ---
+var lastRow = sheet.getLastRow();
+var numRows = lastRow - 1; // Exclude header
+if (numRows < 1) return; // No data to update
 
-      try {
-        var categoryRange = sheet.getRange(categoryRangeString);
+// Read the IDs to map them
+var idValues = sheet.getRange(2, idColIdx + 1, numRows, 1).getValues();
 
-        var updatedCategory = transactionList[i]["category"];
-        if (!categoryList.includes(updatedCategory)) {
-          updatedCategory = FALLBACK_CATEGORY;
-        }
+// Read the columns we want to update
+var catRange = sheet.getRange(2, catColIdx + 1, numRows, 1);
+var catValues = catRange.getValues();
 
-        categoryRange.setValue(updatedCategory);
-      } catch (error) {
-        Logger.log(error);
-      }
+var descRange = sheet.getRange(2, descColIdx + 1, numRows, 1);
+var descValues = descRange.getValues();
 
-      // Set Updated Description
-      var descRangeString = descriptionColumnLetter + transactionRow;
+// (Optional) Read AI Flag column if you use it
+var aiFlagRange = (aiFlagColIdx !== -1) ? sheet.getRange(2, aiFlagColIdx + 1, numRows, 1) : null;
+var aiFlagValues = (aiFlagRange) ? aiFlagRange.getValues() : null;
 
-      try {
-        var descRange = sheet.getRange(descRangeString);
-        descRange.setValue(transactionList[i]["updated_description"]);
-      } catch (error) {
-        Logger.log(error);
-      }
+// --- STEP 3: Create Fast Lookup Map ---
+// Key = Transaction ID, Value = Array Index (Row)
+var idMap = {};
+for (var i = 0; i < idValues.length; i++) {
+var id = idValues[i][0];
+if (id) idMap[id] = i;
+}
 
-      // Mark Open AI Flag
-      if (openAIFlagColLetter != null) {
-        var openAIFlagRangeString = openAIFlagColLetter + transactionRow;
+// --- STEP 4: Update Data in Memory ---
+var changesMade = false;
 
-        try {
-          var openAIFlagRange = sheet.getRange(openAIFlagRangeString);
-          openAIFlagRange.setValue("TRUE");
-        } catch (error) {
-          Logger.log(error);
-        }
-      }
+for (var i = 0; i < transactionList.length; i++) {
+var tx = transactionList[i];
+var txId = tx["transaction_id"];
+
+// Instant lookup! No more slow textFinder
+if (idMap.hasOwnProperty(txId)) {
+  var rowIndex = idMap[txId];
+  
+  // Update Category (with your validation check)
+  var newCat = tx["category"];
+  // Only update if it's a valid category (matches your screenshot logic)
+  // If you want to force it, remove the !includes check
+  if (categoryList.includes(newCat)) { 
+    catValues[rowIndex][0] = newCat;
+    
+    // Update Description
+    if (tx["updated_description"]) {
+      descValues[rowIndex][0] = tx["updated_description"];
     }
+
+    // Update AI Flag (if applicable)
+    if (aiFlagValues) {
+      aiFlagValues[rowIndex][0] = "TRUE"; // Or whatever flag value you use
+    }
+
+    changesMade = true;
   }
+}
+}
+
+// --- STEP 5: Write Data Back (Batch Write) ---
+if (changesMade) {
+catRange.setValues(catValues);
+descRange.setValues(descValues);
+if (aiFlagRange) aiFlagRange.setValues(aiFlagValues);
+Logger.log("Success: Batch updated transactions instantly.");
+} else {
+Logger.log("No matching transactions found to update.");
+}
 }
 
 function getAllowedCategories() {
