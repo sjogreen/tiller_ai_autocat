@@ -380,7 +380,7 @@ function lookupDescAndCategoryGemini(transactionList, categoryList) {
   };
 
   const startTime = new Date().getTime();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
   var response = UrlFetchApp.fetch(url, options).getContentText();
   var parsedResponse = JSON.parse(response);
 
