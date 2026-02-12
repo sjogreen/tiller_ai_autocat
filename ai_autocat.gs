@@ -202,81 +202,152 @@ function findSimilarTransactions(originalDescription) {
   return previousTransactionList;
 }
 
+// Progressive batch-optimized function - reads IDs in batches of 500 until all
+// target transactions are found, then writes only to contiguous row ranges.
+// Optimized for large sheets where new transactions are at the top.
 function writeUpdatedTransactions(transactionList, categoryList) {
-  var sheet =
-    SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Transactions");
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Transactions");
+  var ID_BATCH_SIZE = 500;
 
-  // Get Column Numbers
-  var headers = sheet.getRange("1:1").getValues()[0];
+  // --- STEP 1: Get All Column Indexes ---
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
-  var descriptionColumnLetter = getColumnLetterFromColumnHeader(
-    headers,
-    DESCRIPTION_COL_NAME
-  );
-  var categoryColumnLetter = getColumnLetterFromColumnHeader(
-    headers,
-    CATEGORY_COL_NAME
-  );
-  var transactionIDColumnLetter = getColumnLetterFromColumnHeader(
-    headers,
-    TRANSACTION_ID_COL_NAME
-  );
-  var openAIFlagColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    AI_AUTOCAT_COL_NAME
-  );
+  var idColIdx = headers.indexOf(TRANSACTION_ID_COL_NAME);
+  var catColIdx = headers.indexOf(CATEGORY_COL_NAME);
+  var descColIdx = headers.indexOf(DESCRIPTION_COL_NAME);
+  var aiFlagColIdx = headers.indexOf(AI_AUTOCAT_COL_NAME);
 
+  if (idColIdx === -1 || catColIdx === -1 || descColIdx === -1) {
+    Logger.log("Error: Critical columns not found. Check your header names.");
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var numRows = lastRow - 1; // Exclude header
+  if (numRows < 1) return; // No data to update
+
+  // Build set of transaction IDs we need to find
+  var targetIds = {};
   for (var i = 0; i < transactionList.length; i++) {
-    // Find Row of transaction
-    var transactionIDRange = sheet.getRange(
-      transactionIDColumnLetter + ":" + transactionIDColumnLetter
-    );
-    var textFinder = transactionIDRange.createTextFinder(
-      transactionList[i]["transaction_id"]
-    );
-    var match = textFinder.findNext();
-    if (match != null) {
-      var transactionRow = match.getRowIndex();
+    targetIds[transactionList[i]["transaction_id"]] = transactionList[i];
+  }
+  var numTargets = transactionList.length;
 
-      // Set Updated Category
-      var categoryRangeString = categoryColumnLetter + transactionRow;
+  // --- STEP 2: Progressive ID Loading ---
+  // Read IDs in batches until we find all target transactions
+  var foundRows = {}; // txId -> sheet row number (1-indexed)
+  var numFound = 0;
+  var rowOffset = 2; // Start after header (row 1)
 
-      try {
-        var categoryRange = sheet.getRange(categoryRangeString);
+  while (numFound < numTargets && rowOffset <= lastRow) {
+    var batchSize = Math.min(ID_BATCH_SIZE, lastRow - rowOffset + 1);
+    var idBatch = sheet.getRange(rowOffset, idColIdx + 1, batchSize, 1).getValues();
 
-        var updatedCategory = transactionList[i]["category"];
-        if (!categoryList.includes(updatedCategory)) {
-          updatedCategory = FALLBACK_CATEGORY;
-        }
-
-        categoryRange.setValue(updatedCategory);
-      } catch (error) {
-        Logger.log(error);
-      }
-
-      // Set Updated Description
-      var descRangeString = descriptionColumnLetter + transactionRow;
-
-      try {
-        var descRange = sheet.getRange(descRangeString);
-        descRange.setValue(transactionList[i]["updated_description"]);
-      } catch (error) {
-        Logger.log(error);
-      }
-
-      // Mark Open AI Flag
-      if (openAIFlagColLetter != null) {
-        var openAIFlagRangeString = openAIFlagColLetter + transactionRow;
-
-        try {
-          var openAIFlagRange = sheet.getRange(openAIFlagRangeString);
-          openAIFlagRange.setValue("TRUE");
-        } catch (error) {
-          Logger.log(error);
-        }
+    for (var i = 0; i < idBatch.length; i++) {
+      var id = idBatch[i][0];
+      if (id && targetIds.hasOwnProperty(id) && !foundRows.hasOwnProperty(id)) {
+        foundRows[id] = rowOffset + i; // Store actual sheet row number
+        numFound++;
+        if (numFound >= numTargets) break;
       }
     }
+
+    rowOffset += batchSize;
   }
+
+  if (numFound === 0) {
+    Logger.log("No matching transactions found to update.");
+    return;
+  }
+
+  Logger.log("Found " + numFound + " of " + numTargets + " transactions in first " + (rowOffset - 2) + " rows.");
+
+  // --- STEP 3: Group Found Rows into Contiguous Ranges ---
+  var rowNumbers = [];
+  for (var txId in foundRows) {
+    rowNumbers.push(foundRows[txId]);
+  }
+  rowNumbers.sort(function(a, b) { return a - b; });
+
+  var ranges = [];
+  var rangeStart = rowNumbers[0];
+  var rangeEnd = rowNumbers[0];
+
+  for (var i = 1; i < rowNumbers.length; i++) {
+    if (rowNumbers[i] === rangeEnd + 1) {
+      // Contiguous, extend current range
+      rangeEnd = rowNumbers[i];
+    } else {
+      // Gap found, save current range and start new one
+      ranges.push({ start: rangeStart, end: rangeEnd });
+      rangeStart = rowNumbers[i];
+      rangeEnd = rowNumbers[i];
+    }
+  }
+  ranges.push({ start: rangeStart, end: rangeEnd }); // Don't forget last range
+
+  Logger.log("Grouped into " + ranges.length + " contiguous range(s).");
+
+  // --- STEP 4: Process Each Contiguous Range ---
+  var totalUpdated = 0;
+
+  for (var r = 0; r < ranges.length; r++) {
+    var range = ranges[r];
+    var rangeSize = range.end - range.start + 1;
+
+    try {
+      // Read current values for this range
+      var catRange = sheet.getRange(range.start, catColIdx + 1, rangeSize, 1);
+      var catValues = catRange.getValues();
+
+      var descRange = sheet.getRange(range.start, descColIdx + 1, rangeSize, 1);
+      var descValues = descRange.getValues();
+
+      var aiFlagRange = (aiFlagColIdx !== -1) ?
+        sheet.getRange(range.start, aiFlagColIdx + 1, rangeSize, 1) : null;
+      var aiFlagValues = (aiFlagRange) ? aiFlagRange.getValues() : null;
+
+      // Update values in memory
+      for (var txId in foundRows) {
+        var sheetRow = foundRows[txId];
+        if (sheetRow >= range.start && sheetRow <= range.end) {
+          var localIdx = sheetRow - range.start;
+          var tx = targetIds[txId];
+
+          // Update Category - use fallback if not in allowed list
+          var newCat = tx["category"];
+          if (!categoryList.includes(newCat)) {
+            newCat = FALLBACK_CATEGORY;
+          }
+          catValues[localIdx][0] = newCat;
+
+          // Update Description (preserve existing if not provided)
+          if (tx["updated_description"]) {
+            descValues[localIdx][0] = tx["updated_description"];
+          }
+
+          // Update AI Flag (if column exists)
+          if (aiFlagValues) {
+            aiFlagValues[localIdx][0] = "TRUE";
+          }
+
+          totalUpdated++;
+        }
+      }
+
+      // Write updated values back
+      catRange.setValues(catValues);
+      descRange.setValues(descValues);
+      if (aiFlagRange) {
+        aiFlagRange.setValues(aiFlagValues);
+      }
+
+    } catch (error) {
+      Logger.log("Error processing range " + range.start + "-" + range.end + ": " + error);
+    }
+  }
+
+  Logger.log("Success: Updated " + totalUpdated + " transactions across " + ranges.length + " range(s).");
 }
 
 function getAllowedCategories() {
