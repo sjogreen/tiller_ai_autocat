@@ -75,17 +75,21 @@ your first push.
 
 Apps Script allows only one `onOpen` per project, so a sheet that already has its
 own menu code cannot simply take this repo's `code.gs`.  Rather than hand-merging
-it (which makes `code.gs` impossible to update), define `addLocalMenuItems` in a
-file of your own and `onOpen` will call it if it exists:
+it (which makes `code.gs` impossible to update), define `addLocalMenus` in a file
+of your own and `onOpen` will call it if it exists, passing the `Ui`:
 
 ```javascript
 // personal.gs - your file, not part of this repo
-function addLocalMenuItems(menu) {
-  menu.addItem('My Own Thing', 'myOwnFunction');
+function addLocalMenus(ui) {
+  ui.createMenu('My Own Menu')
+      .addItem('My Own Thing', 'myOwnFunction')
+      .addToUi();
 }
 
 function myOwnFunction() { ... }
 ```
+
+Your items go in a menu of your own, separate from "Tiller AI AutoCat".
 
 If you install with clasp, keep that file in the repo directory so it gets pushed
 with the rest, and add it to `.gitignore` so it never gets committed.  `personal.gs`
