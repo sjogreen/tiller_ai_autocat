@@ -36,8 +36,16 @@
                 .replace("/*O_o*/\n", "") // remove JSONP wrapper
                 .replace(/(google\.visualization\.Query\.setResponse\()|(\);)/gm, "") // remove JSONP wrapper
 
-        Logger.log("Response from Query: " + rawResponse);
-        var response = JSON.parse(rawResponse);
+        var response;
+        try {
+            response = JSON.parse(rawResponse);
+        } catch (error) {
+            // Only log the raw payload when it could not be parsed. Logging it on
+            // every call wrote the entire queried transaction set into the
+            // execution log.
+            Logger.log("Could not parse gviz response: " + rawResponse);
+            throw error;
+        }
 
         var table = response.table;
         var rows;

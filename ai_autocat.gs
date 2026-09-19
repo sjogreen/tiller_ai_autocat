@@ -1,10 +1,35 @@
-// API Keys
-const OPENAI_API_KEY = '';
-const GOOGLE_API_KEY = '';
+// Two invariants this script relies on. Please preserve them when editing:
+//
+// (a) Columns can appear in any order. Never assume a column position - always
+//     resolve a column from its header name via getColumnLetterFromColumnHeader,
+//     and treat an empty result as "this column is not present".
+//
+// (b) Only ever write the specific cells you intend to change. Never write a
+//     whole row, even one padded with blanks: Tiller sheets commonly define
+//     ARRAYFORMULA at the column level, and writing a literal into such a column
+//     permanently breaks the formula for the entire sheet.
 
-// LLM To Use
-const AI_PROVIDER = 'gemini' // Can be 'gemini' or 'openai'
-const GPT_MODEL = 'gpt-4o-mini' // Can be any openai model designator
+// Google Cloud / Vertex AI Settings
+// There is no API key here on purpose. Requests are authenticated with Application
+// Default Credentials - ScriptApp.getOAuthToken() returns a token for whoever runs
+// the script, and Vertex AI authorizes it via IAM. See the README for setup.
+// Your Google Cloud project ID is read from Script Properties rather than being
+// hardcoded here, so it never ends up in source control. Set it once in the Apps
+// Script editor: Project Settings -> Script Properties -> Add script property,
+// with the name GCP_PROJECT_ID. See the README.
+const GCP_PROJECT_ID_PROPERTY = 'GCP_PROJECT_ID';
+
+// 'global' routes to whichever region has capacity - best availability and the
+// widest model support. Use a specific region (e.g. 'us-west1') if you need your
+// requests to stay in one geography.
+const GCP_LOCATION = 'global';
+const GEMINI_MODEL = 'gemini-2.5-flash'; // Can be any model Vertex AI publishes
+
+// Pricing for GEMINI_MODEL on Vertex AI, in US dollars per million tokens.
+// Used only for the cost estimate written to the log. Check current rates at
+// https://cloud.google.com/vertex-ai/generative-ai/pricing
+const INPUT_COST_PER_M_TOKENS = 0.3;
+const OUTPUT_COST_PER_M_TOKENS = 2.5;
 
 // Sheet Names
 const TRANSACTION_SHEET_NAME = "Transactions";
@@ -58,30 +83,16 @@ function categorizeUncategorizedTransactions() {
 
   var categoryList = getAllowedCategories();
 
-  var updatedTransactions;
-  if (AI_PROVIDER == 'gemini') {
-    Logger.log(
-      "Using Gemini"
-    );
+  Logger.log("Using Gemini (" + GEMINI_MODEL + ") on Vertex AI");
 
-    updatedTransactions = lookupDescAndCategoryGemini(
-      transactionList,
-      categoryList
-    );
-  } else {
-    Logger.log(
-      "Using OpenAI"
-    );
+  var updatedTransactions = lookupDescAndCategoryGemini(
+    transactionList,
+    categoryList
+  );
 
-    updatedTransactions = lookupDescAndCategoryOpenai(
-      transactionList,
-      categoryList
-    );
-  }
-  
   if (updatedTransactions != null) {
     Logger.log(
-      "The selected AI returned the following sugested categories and descriptions:"
+      "Gemini returned the following sugested categories and descriptions:"
     );
     Logger.log(updatedTransactions);
     Logger.log("Writing updated transactions into your sheet...");
@@ -202,19 +213,117 @@ function findSimilarTransactions(originalDescription) {
   return previousTransactionList;
 }
 
-// Progressive batch-optimized function - reads IDs in batches of 500 until all
-// target transactions are found, then writes only to contiguous row ranges.
-// Optimized for large sheets where new transactions are at the top.
+/**
+ * Groups individual cell writes into the smallest set of rectangular blocks that
+ * covers exactly those cells and no others.
+ *
+ * This exists to serve invariant (b). Batching is safe only when every cell in
+ * the block is one we meant to write: a block that spanned an untouched column
+ * or row would overwrite it, and on a Tiller sheet that usually means destroying
+ * an ARRAYFORMULA. Cells are merged horizontally into runs of adjacent columns,
+ * then those runs are merged vertically when consecutive rows share the same
+ * span. Anything with a gap stays a separate write.
+ *
+ * @param {Array<{row: number, column: number, value: *}>} cells 1-based cells.
+ * @returns {Array<{row: number, column: number, values: Array<Array<*>>}>}
+ */
+function planCellWrites(cells) {
+  if (cells.length === 0) {
+    return [];
+  }
+
+  // Group by row, then split each row into runs of adjacent columns.
+  var byRow = {};
+  for (var i = 0; i < cells.length; i++) {
+    var cell = cells[i];
+    if (!byRow[cell.row]) {
+      byRow[cell.row] = [];
+    }
+    byRow[cell.row].push(cell);
+  }
+
+  var runs = [];
+  var rowNumbers = Object.keys(byRow)
+    .map(Number)
+    .sort(function (a, b) {
+      return a - b;
+    });
+
+  for (var r = 0; r < rowNumbers.length; r++) {
+    var row = rowNumbers[r];
+    var rowCells = byRow[row].sort(function (a, b) {
+      return a.column - b.column;
+    });
+
+    var current = null;
+    for (var c = 0; c < rowCells.length; c++) {
+      if (current && rowCells[c].column === current.column + current.values.length) {
+        current.values.push(rowCells[c].value);
+      } else {
+        current = {
+          row: row,
+          column: rowCells[c].column,
+          values: [rowCells[c].value],
+        };
+        runs.push(current);
+      }
+    }
+  }
+
+  // Merge runs downward when the row below covers exactly the same columns.
+  var blocks = [];
+  var consumed = {};
+
+  for (var j = 0; j < runs.length; j++) {
+    if (consumed[j]) {
+      continue;
+    }
+
+    var block = {
+      row: runs[j].row,
+      column: runs[j].column,
+      values: [runs[j].values],
+    };
+
+    var nextRow = runs[j].row + 1;
+    for (var k = j + 1; k < runs.length; k++) {
+      if (consumed[k] || runs[k].row !== nextRow) {
+        continue;
+      }
+      if (
+        runs[k].column !== block.column ||
+        runs[k].values.length !== block.values[0].length
+      ) {
+        continue;
+      }
+      block.values.push(runs[k].values);
+      consumed[k] = true;
+      nextRow++;
+    }
+
+    blocks.push(block);
+  }
+
+  return blocks;
+}
+
+// Reads the transaction ID column in batches until every target transaction has
+// been located - new transactions sit at the top of a Tiller sheet, so this
+// usually touches only the first batch - then writes just the cells that change.
 function writeUpdatedTransactions(transactionList, categoryList) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Transactions");
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
+    TRANSACTION_SHEET_NAME
+  );
   var ID_BATCH_SIZE = 500;
 
-  // --- STEP 1: Get All Column Indexes ---
+  // --- STEP 1: Resolve column positions ---
+  // Invariant (a): every column is resolved from its header, never assumed.
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
   var idColIdx = headers.indexOf(TRANSACTION_ID_COL_NAME);
   var catColIdx = headers.indexOf(CATEGORY_COL_NAME);
   var descColIdx = headers.indexOf(DESCRIPTION_COL_NAME);
+  // Optional column: indexOf returns -1 when it is absent.
   var aiFlagColIdx = headers.indexOf(AI_AUTOCAT_COL_NAME);
 
   if (idColIdx === -1 || catColIdx === -1 || descColIdx === -1) {
@@ -223,8 +332,9 @@ function writeUpdatedTransactions(transactionList, categoryList) {
   }
 
   var lastRow = sheet.getLastRow();
-  var numRows = lastRow - 1; // Exclude header
-  if (numRows < 1) return; // No data to update
+  if (lastRow < 2) {
+    return; // No data rows
+  }
 
   // Build set of transaction IDs we need to find
   var targetIds = {};
@@ -241,12 +351,20 @@ function writeUpdatedTransactions(transactionList, categoryList) {
 
   while (numFound < numTargets && rowOffset <= lastRow) {
     var batchSize = Math.min(ID_BATCH_SIZE, lastRow - rowOffset + 1);
-    var idBatch = sheet.getRange(rowOffset, idColIdx + 1, batchSize, 1).getValues();
+    var idBatch = sheet
+      .getRange(rowOffset, idColIdx + 1, batchSize, 1)
+      .getValues();
 
-    for (var i = 0; i < idBatch.length; i++) {
-      var id = idBatch[i][0];
-      if (id && targetIds.hasOwnProperty(id) && !foundRows.hasOwnProperty(id)) {
-        foundRows[id] = rowOffset + i; // Store actual sheet row number
+    for (var b = 0; b < idBatch.length; b++) {
+      var id = idBatch[b][0];
+      // hasOwnProperty via Object.prototype, so that an id colliding with an
+      // inherited member name cannot produce a false match.
+      if (
+        id !== "" &&
+        Object.prototype.hasOwnProperty.call(targetIds, id) &&
+        !Object.prototype.hasOwnProperty.call(foundRows, id)
+      ) {
+        foundRows[id] = rowOffset + b; // Store actual sheet row number
         numFound++;
         if (numFound >= numTargets) break;
       }
@@ -260,94 +378,89 @@ function writeUpdatedTransactions(transactionList, categoryList) {
     return;
   }
 
-  Logger.log("Found " + numFound + " of " + numTargets + " transactions in first " + (rowOffset - 2) + " rows.");
+  Logger.log(
+    "Found " +
+      numFound +
+      " of " +
+      numTargets +
+      " transactions in first " +
+      (rowOffset - 2) +
+      " rows."
+  );
 
-  // --- STEP 3: Group Found Rows into Contiguous Ranges ---
-  var rowNumbers = [];
+  // --- STEP 3: Collect the cells we intend to change ---
+  // Invariant (b): nothing outside this list may be written. planCellWrites
+  // batches these into rectangles only where every cell in the rectangle is one
+  // of them, so a column or row we do not own is never overwritten - which on a
+  // Tiller sheet would mean destroying an ARRAYFORMULA.
+  var cellsToWrite = [];
+
   for (var txId in foundRows) {
-    rowNumbers.push(foundRows[txId]);
-  }
-  rowNumbers.sort(function(a, b) { return a - b; });
+    var transactionRow = foundRows[txId];
+    var tx = targetIds[txId];
 
-  var ranges = [];
-  var rangeStart = rowNumbers[0];
-  var rangeEnd = rowNumbers[0];
+    var updatedCategory = tx["category"];
+    if (!categoryList.includes(updatedCategory)) {
+      updatedCategory = FALLBACK_CATEGORY;
+    }
 
-  for (var i = 1; i < rowNumbers.length; i++) {
-    if (rowNumbers[i] === rangeEnd + 1) {
-      // Contiguous, extend current range
-      rangeEnd = rowNumbers[i];
-    } else {
-      // Gap found, save current range and start new one
-      ranges.push({ start: rangeStart, end: rangeEnd });
-      rangeStart = rowNumbers[i];
-      rangeEnd = rowNumbers[i];
+    cellsToWrite.push({
+      row: transactionRow,
+      column: catColIdx + 1,
+      value: updatedCategory,
+    });
+
+    // Leave the existing description untouched when the model did not return
+    // one, rather than blanking it or rewriting it with its current value.
+    if (tx["updated_description"]) {
+      cellsToWrite.push({
+        row: transactionRow,
+        column: descColIdx + 1,
+        value: tx["updated_description"],
+      });
+    }
+
+    if (aiFlagColIdx !== -1) {
+      cellsToWrite.push({
+        row: transactionRow,
+        column: aiFlagColIdx + 1,
+        value: "TRUE",
+      });
     }
   }
-  ranges.push({ start: rangeStart, end: rangeEnd }); // Don't forget last range
 
-  Logger.log("Grouped into " + ranges.length + " contiguous range(s).");
+  // --- STEP 4: Write ---
+  var blocks = planCellWrites(cellsToWrite);
 
-  // --- STEP 4: Process Each Contiguous Range ---
-  var totalUpdated = 0;
-
-  for (var r = 0; r < ranges.length; r++) {
-    var range = ranges[r];
-    var rangeSize = range.end - range.start + 1;
-
+  for (var w = 0; w < blocks.length; w++) {
     try {
-      // Read current values for this range
-      var catRange = sheet.getRange(range.start, catColIdx + 1, rangeSize, 1);
-      var catValues = catRange.getValues();
-
-      var descRange = sheet.getRange(range.start, descColIdx + 1, rangeSize, 1);
-      var descValues = descRange.getValues();
-
-      var aiFlagRange = (aiFlagColIdx !== -1) ?
-        sheet.getRange(range.start, aiFlagColIdx + 1, rangeSize, 1) : null;
-      var aiFlagValues = (aiFlagRange) ? aiFlagRange.getValues() : null;
-
-      // Update values in memory
-      for (var txId in foundRows) {
-        var sheetRow = foundRows[txId];
-        if (sheetRow >= range.start && sheetRow <= range.end) {
-          var localIdx = sheetRow - range.start;
-          var tx = targetIds[txId];
-
-          // Update Category - use fallback if not in allowed list
-          var newCat = tx["category"];
-          if (!categoryList.includes(newCat)) {
-            newCat = FALLBACK_CATEGORY;
-          }
-          catValues[localIdx][0] = newCat;
-
-          // Update Description (preserve existing if not provided)
-          if (tx["updated_description"]) {
-            descValues[localIdx][0] = tx["updated_description"];
-          }
-
-          // Update AI Flag (if column exists)
-          if (aiFlagValues) {
-            aiFlagValues[localIdx][0] = "TRUE";
-          }
-
-          totalUpdated++;
-        }
-      }
-
-      // Write updated values back
-      catRange.setValues(catValues);
-      descRange.setValues(descValues);
-      if (aiFlagRange) {
-        aiFlagRange.setValues(aiFlagValues);
-      }
-
+      sheet
+        .getRange(
+          blocks[w].row,
+          blocks[w].column,
+          blocks[w].values.length,
+          blocks[w].values[0].length
+        )
+        .setValues(blocks[w].values);
     } catch (error) {
-      Logger.log("Error processing range " + range.start + "-" + range.end + ": " + error);
+      Logger.log(
+        "Error writing block at row " +
+          blocks[w].row +
+          ", column " +
+          blocks[w].column +
+          ": " +
+          error
+      );
     }
   }
 
-  Logger.log("Success: Updated " + totalUpdated + " transactions across " + ranges.length + " range(s).");
+  Logger.log(
+    "Success: Updated " +
+      numFound +
+      " transactions in " +
+      blocks.length +
+      " write(s)."
+  );
 }
 
 function getAllowedCategories() {
@@ -364,13 +477,22 @@ function getAllowedCategories() {
     .getRange(categoryColLetter + "2:" + categoryColLetter)
     .getValues();
 
+  // The open-ended range above runs to the bottom of the sheet, so most of what
+  // comes back is blank. Drop those rather than padding the model prompt with
+  // hundreds of empty strings on every call.
   var categoryList = [];
   for (var i = 0; i < categoryListRaw.length; i++) {
-    categoryList.push(categoryListRaw[i][0]);
+    var category = categoryListRaw[i][0];
+    if (category !== "" && category !== null) {
+      categoryList.push(category);
+    }
   }
   return categoryList;
 }
 
+// Resolves a column header name to its A1 column letter, supporting invariant (a).
+// Returns "" when the column is not present, so callers testing for an optional
+// column must check truthiness rather than comparing against null.
 function getColumnLetterFromColumnHeader(columnHeaders, columnName) {
   var columnIndex = columnHeaders.indexOf(columnName);
   var columnLetter = "";
@@ -389,14 +511,30 @@ function getColumnLetterFromColumnHeader(columnHeaders, columnName) {
 }
 
 function lookupDescAndCategoryGemini(transactionList, categoryList) {
+  const projectId = PropertiesService.getScriptProperties().getProperty(
+    GCP_PROJECT_ID_PROPERTY
+  );
+
+  if (!projectId) {
+    Logger.log(
+      "The " +
+        GCP_PROJECT_ID_PROPERTY +
+        " script property is not set. In the Apps Script editor go to " +
+        "Project Settings -> Script Properties and add it, using your Google " +
+        "Cloud project ID as the value. See the README for full setup steps."
+    );
+    return null;
+  }
+
   var transactionDict = {
     transactions: transactionList,
   };
 
   const request = {
-    system_instruction: {
-      parts: {
-        text: `
+    systemInstruction: {
+      parts: [
+        {
+          text: `
         Act as an API that categorizes and cleans up bank transaction descriptions for for a personal finance app. Respond with only JSON.
 
         Reference the following list of allowed_categories:
@@ -432,155 +570,110 @@ function lookupDescAndCategoryGemini(transactionList, categoryList) {
               }
             ]}
         `,
-      },
+        },
+      ],
     },
-    contents: {
-      parts: {
-        text: JSON.stringify(transactionDict),
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: JSON.stringify(transactionDict) }],
       },
+    ],
+    generationConfig: {
+      responseMimeType: "application/json",
     },
   };
-
-  const jsonRequest = JSON.stringify(request);
 
   const options = {
     method: "POST",
     contentType: "application/json",
-    payload: jsonRequest,
+    // Application Default Credentials: this token belongs to whoever is running
+    // the script, and Vertex AI checks their IAM role on GCP_PROJECT_ID.
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify(request),
     muteHttpExceptions: true,
   };
 
-  const startTime = new Date().getTime();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_API_KEY}`;
-  var response = UrlFetchApp.fetch(url, options).getContentText();
-  var parsedResponse = JSON.parse(response);
+  // Regional endpoints are prefixed with the region; the 'global' endpoint is not.
+  const host =
+    GCP_LOCATION == "global"
+      ? "aiplatform.googleapis.com"
+      : GCP_LOCATION + "-aiplatform.googleapis.com";
 
-  const usage = parsedResponse.usageMetadata;
-  const inputCostPerM = 0.075;
-  const outputCostPerM = 0.3;
-  const inputCost = (usage.promptTokenCount / 1000000) * inputCostPerM;
-  const outputCost = (usage.candidatesTokenCount / 1000000) * outputCostPerM;
-  const totalCost = inputCost + outputCost;
+  const url =
+    "https://" +
+    host +
+    "/v1/projects/" +
+    projectId +
+    "/locations/" +
+    GCP_LOCATION +
+    "/publishers/google/models/" +
+    GEMINI_MODEL +
+    ":generateContent";
+
+  const startTime = new Date().getTime();
+  const response = UrlFetchApp.fetch(url, options);
   const elapsedTime = new Date().getTime() - startTime;
 
-  const stats = {
-    elapsedTime: elapsedTime,
-    numTransactions: transactionList.length,
-    totalCost: totalCost,
-    inputTokens: usage.promptTokenCount,
-    outputTokens: usage.candidatesTokenCount,
-  };
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
 
-  Logger.log(stats);
-
-  if ("error" in parsedResponse) {
-    Logger.log("Error from Gemini: " + parsedResponse);
+  if (responseCode != 200) {
+    Logger.log(
+      "Error from Vertex AI (HTTP " + responseCode + "): " + responseText
+    );
     return null;
   }
 
-  const rawText =
-    parsedResponse["candidates"][0]["content"]["parts"][0]["text"];
+  const parsedResponse = JSON.parse(responseText);
+  if ("error" in parsedResponse) {
+    Logger.log("Error from Vertex AI: " + JSON.stringify(parsedResponse.error));
+    return null;
+  }
+
+  logUsageStats(parsedResponse.usageMetadata, transactionList.length, elapsedTime);
+
+  const candidate = parsedResponse.candidates && parsedResponse.candidates[0];
+  const parts = candidate && candidate.content && candidate.content.parts;
+  if (!parts || parts.length == 0) {
+    Logger.log(
+      "Vertex AI returned no usable content. Full response: " + responseText
+    );
+    return null;
+  }
+
+  // responseMimeType asks for bare JSON, but trim anything outside the outermost
+  // braces in case the model still wraps it in prose or a code fence.
+  const rawText = parts[0].text;
   const jsonStart = rawText.indexOf("{");
   const jsonEnd = rawText.lastIndexOf("}") + 1; // +1 to include the closing brace
   const cleanText = rawText.substring(jsonStart, jsonEnd);
 
-  // Now parse the cleaned JSON
   const apiResponse = JSON.parse(cleanText);
   return apiResponse["suggested_transactions"];
 }
 
-function lookupDescAndCategoryOpenai(
-  transactionList,
-  categoryList,
-  model = GPT_MODEL) {
-  var transactionDict = {
-    transactions: transactionList,
-  };
-
-  const request = {
-    model: model,
-    temperature: 0.2,
-    top_p: 0.1,
-    seed: 1,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content:
-          "Act as an API that categorizes and cleans up bank transaction descriptions for for a personal finance app.",
-      },
-      {
-        role: "system",
-        content:
-          "Reference the following list of allowed_categories:\n" +
-          JSON.stringify(categoryList),
-      },
-      {
-        role: "system",
-        content:
-          'You will be given JSON input with a list of transaction descriptions and potentially related previously categorized transactions in the following format: \
-            {"transactions": [\
-              {\
-                "transaction_id": "A unique ID for this transaction"\
-                "original_description": "The original raw transaction description",\
-                "previous_transactions": "(optional) Previously cleaned up transaction descriptions and the prior \
-                category used that may be related to this transaction\
-              }\
-            ]}\n\
-            For each transaction provided, follow these instructions:\n\
-            (0) If previous_transactions were provided, see if the current transaction matches a previous one closely. \
-                If it does, use the updated_description and category of the previous transaction exactly, \
-                including capitalization and punctuation.\
-            (1) If there is no matching previous_transaction, or none was provided suggest a better “updated_description” according to the following rules:\n\
-            (a) Use all of your knowledge and information to propose a friendly, human readable updated_description for the \
-              transaction given the original_description. The input often contains the name of a merchant name. \
-              If you know of a merchant it might be referring to, use the name of that merchant for the suggested description.\n\
-            (b) Keep the suggested description as simple as possible. Remove punctuation, extraneous \
-              numbers, location information, abbreviations such as "Inc." or "LLC", IDs and account numbers.\n\
-            (2) For each original_description, suggest a “category” for the transaction from the allowed_categories list that was provided.\n\
-            (3) If you are not confident in the suggested category after using your own knowledge and the previous transactions provided, use the cateogry "' +
-          FALLBACK_CATEGORY +
-          '"\n\n\
-            (4) Your response should be a JSON object and no other text.  The response object should be of the form:\n\
-            {"suggested_transactions": [\
-              {\
-                "transaction_id": "The unique ID previously provided for this transaction",\
-                "updated_description": "The cleaned up version of the description",\
-                "category": "A category selected from the allowed_categories list"\
-              }\
-            ]}',
-      },
-      {
-        role: "user",
-        content: JSON.stringify(transactionDict),
-      },
-    ],
-  };
-
-  const jsonRequest = JSON.stringify(request);
-
-  const options = {
-    method: "POST",
-    contentType: "application/json",
-    headers: { Authorization: "Bearer " + OPENAI_API_KEY },
-    payload: jsonRequest,
-    muteHttpExceptions: true,
-  };
-
-  var response = UrlFetchApp.fetch(
-    "https://api.openai.com/v1/chat/completions",
-    options
-  ).getContentText();
-  var parsedResponse = JSON.parse(response);
-
-  if ("error" in parsedResponse) {
-    Logger.log("Error from Open AI: " + parsedResponse["error"]["message"]);
-
-    return null;
-  } else {
-    var apiResponse = JSON.parse(
-      parsedResponse["choices"][0]["message"]["content"]
-    );
-    return apiResponse["suggested_transactions"];
+function logUsageStats(usage, numTransactions, elapsedTime) {
+  if (!usage) {
+    return;
   }
+
+  // Gemini 2.5 models bill thinking tokens at the output rate, and report them
+  // separately from candidatesTokenCount.
+  const inputTokens = usage.promptTokenCount || 0;
+  const outputTokens =
+    (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
+
+  const inputCost = (inputTokens / 1000000) * INPUT_COST_PER_M_TOKENS;
+  const outputCost = (outputTokens / 1000000) * OUTPUT_COST_PER_M_TOKENS;
+
+  const stats = {
+    elapsedTime: elapsedTime,
+    numTransactions: numTransactions,
+    totalCost: inputCost + outputCost,
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+  };
+
+  Logger.log(stats);
 }
