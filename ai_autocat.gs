@@ -23,13 +23,17 @@ const GCP_PROJECT_ID_PROPERTY = 'GCP_PROJECT_ID';
 // widest model support. Use a specific region (e.g. 'us-west1') if you need your
 // requests to stay in one geography.
 const GCP_LOCATION = 'global';
-const GEMINI_MODEL = 'gemini-2.5-flash'; // Can be any model Vertex AI publishes
+const GEMINI_MODEL = 'gemini-3.8-flash'; // Can be any model Vertex AI publishes
 
 // Pricing for GEMINI_MODEL on Vertex AI, in US dollars per million tokens.
 // Used only for the cost estimate written to the log. Check current rates at
 // https://cloud.google.com/vertex-ai/generative-ai/pricing
-const INPUT_COST_PER_M_TOKENS = 0.3;
-const OUTPUT_COST_PER_M_TOKENS = 2.5;
+//
+// These are gemini-3.8-flash introductory rates, which run through 2026-12-31.
+// On 2027-01-01 they go to 1.5 and 7.5 - until these are updated the logged
+// estimate will read half of what you are actually billed.
+const INPUT_COST_PER_M_TOKENS = 0.75;
+const OUTPUT_COST_PER_M_TOKENS = 3.75;
 
 // Sheet Names
 const TRANSACTION_SHEET_NAME = "Transactions";
@@ -658,8 +662,9 @@ function logUsageStats(usage, numTransactions, elapsedTime) {
     return;
   }
 
-  // Gemini 2.5 models bill thinking tokens at the output rate, and report them
-  // separately from candidatesTokenCount.
+  // Gemini bills thinking tokens at the output rate, and reports them separately
+  // from candidatesTokenCount. The 3.x models think more than 2.5 did, so this
+  // term is a larger share of the cost than it used to be.
   const inputTokens = usage.promptTokenCount || 0;
   const outputTokens =
     (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
