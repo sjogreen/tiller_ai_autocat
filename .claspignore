@@ -1,0 +1,10 @@
+# Push only the Apps Script sources. Everything else in this repo
+# (tests, README, tooling) must never reach the script project.
+**/**
+!appsscript.json
+!ai_autocat.gs
+!code.gs
+!gviz.gs
+!tfidf_search.gs
+# Local-only, gitignored: see .gitignore
+!personal.gs

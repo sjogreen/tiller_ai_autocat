@@ -1,0 +1,5 @@
+node_modules/
+# Personal: points at one specific spreadsheet's bound script project.
+.clasp.json
+# Local-only Apps Script additions for that spreadsheet (pushed, never committed).
+personal.gs

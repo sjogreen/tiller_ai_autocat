@@ -4,7 +4,13 @@
   "private": true,
   "description": "Apps Script to categorize Tiller transactions with Gemini on Vertex AI",
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "sheet:status": "clasp show-file-status",
+    "sheet:pull": "clasp pull",
+    "sheet:push": "clasp push --force"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@google/clasp": "^3.4.1"
+  }
 }
