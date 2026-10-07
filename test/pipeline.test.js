@@ -553,3 +553,71 @@ test("a rent check is shown its rent precedents, not the newest random checks", 
     [["Rent", -2850], ["Rent", -2850], ["Rent", -2850]]
   );
 });
+
+// --- Parity with Compound (web/src/lib/categorizePrepare.unit.spec.ts @ 24735a98) ---
+// Same data and expectations as Compound's tests, run through Tiller's search
+// and closestByAmount with the production settings.
+
+function compoundSearch(context, docs, query, amount) {
+  const searcher = new context.TFIDFSearch(
+    docs.map((d) => ({
+      id: d.id,
+      text: d.rawText,
+      updatedText: "",
+      category: d.categoryId,
+      amount: d.amount,
+      date: d.date ? new Date(d.date) : null,
+    })),
+    { useStopWords: true, matchThreshold: 0.25, minTermSize: 3 }
+  );
+  return plain(
+    context.closestByAmount(
+      searcher.search(query, context.PRECEDENT_CANDIDATES),
+      amount,
+      context.EXAMPLES_PER_ROW
+    )
+  );
+}
+
+const UNRELATED = [
+  "ELECTRIC UTILITY", "WATER DISTRICT", "BLUE BOTTLE COFFEE", "CHEVRON STATION",
+  "NETFLIX STREAMING", "PACIFIC TELEPHONE", "GOLDEN GATE PARKING", "WHOLE FOODS",
+  "AIRLINE TICKETS", "HARDWARE STORE",
+].map((rawText, i) => ({ id: "unrelated-" + i, rawText, categoryId: "other", amount: -20 }));
+
+test("parity: shows the matches closest in amount when more tie on the text than there are slots", () => {
+  const { context } = loadScripts(SOURCES);
+  // const declarations are not properties of the vm context; expose them.
+  context.PRECEDENT_CANDIDATES = vmConst(context, "PRECEDENT_CANDIDATES");
+  context.EXAMPLES_PER_ROW = vmConst(context, "EXAMPLES_PER_ROW");
+  const checks = [-40, -120, -310, -455, -620, -880, -2850, -1020].map((value, i) => ({
+    id: "check-" + i,
+    rawText: "CHECK #" + (1001 + i),
+    categoryId: value === -2850 ? "rent" : value === -40 ? "gift" : "misc",
+    amount: value,
+    date: "2026-0" + (1 + i) + "-02",
+  }));
+  const chosen = compoundSearch(context, [...checks, ...UNRELATED], "CHECK #1060", -2850);
+  assert.deepStrictEqual(chosen.map((x) => x.amount), [-2850, -1020, -880, -620, -455, -40]);
+});
+
+test("parity: keeps the text ranking when the matches do not tie", () => {
+  const { context } = loadScripts(SOURCES);
+  context.PRECEDENT_CANDIDATES = vmConst(context, "PRECEDENT_CANDIDATES");
+  context.EXAMPLES_PER_ROW = vmConst(context, "EXAMPLES_PER_ROW");
+  const chosen = compoundSearch(
+    context,
+    [
+      ...UNRELATED,
+      { id: "store", rawText: "SAFEWAY MARKET", categoryId: "groceries", amount: -900 },
+      { id: "fuel", rawText: "SAFEWAY FUEL", categoryId: "fuel", amount: -10 },
+    ],
+    "SAFEWAY MARKET 123",
+    -10
+  );
+  assert.deepStrictEqual(chosen.map((x) => x.category), ["groceries", "fuel"]);
+});
+
+function vmConst(context, name) {
+  return require("vm").runInContext(name, context);
+}
