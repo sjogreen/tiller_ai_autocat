@@ -13,7 +13,11 @@ Apps Script code to use Gemini to automatically categorize financial transaction
 
 ## How it works
 
-Each run takes up to 50 transactions that have a Full Description and no Category.
+Each run works through transactions that have a Full Description and no Category
+in batches of up to 50, writing each batch's results before starting the next.
+It keeps going while another batch is expected to finish within 5 minutes
+(Apps Script stops a run at 6), so a large backlog may take a few runs; the log
+says when it stopped early.  The steps below happen for each batch.
 Any of those that have no Transaction ID (usually rows added by hand) are first
 given one, `autocat:` followed by a [ULID](https://github.com/ulid/spec), so the
 answer can be written back to the right row.  Only rows the run is about to send

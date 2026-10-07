@@ -699,13 +699,14 @@ test("ulid() is 26 Crockford base-32 characters that sort by time", () => {
  * A sheet whose gviz query is answered from the sheet's current contents, so
  * ids written before the query are visible to it, as on a real sheet.
  */
-function liveRun(sheetRows, geminiAnswer) {
+function liveRun(sheetRows, geminiAnswer, runOptions, extra) {
   const sheet = new FakeSheet("Transactions", HEADERS, sheetRows);
   const spreadsheet = new FakeSpreadsheet({
     Transactions: sheet,
     Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
   });
   let flushed = false;
+  const geminiCalls = [];
   const col = (name) => HEADERS.indexOf(name);
   const loaded = loadScripts(SOURCES, {
     spreadsheet,
@@ -728,11 +729,13 @@ function liveRun(sheetRows, geminiAnswer) {
         return { getContentText: () => gvizResponse(rows) };
       }
       const payload = JSON.parse(JSON.parse(params.payload).contents[0].parts[0].text);
+      geminiCalls.push(payload.transactions.map((t) => t.transaction_id));
+      if (extra && extra.geminiFails) return response(500, { error: { message: "down" } });
       return geminiResponse(payload.transactions.map(geminiAnswer));
     },
   });
-  loaded.context.categorizeUncategorizedTransactions();
-  return { sheet, logs: loaded.logs };
+  loaded.context.categorizeUncategorizedTransactions(runOptions);
+  return { sheet, logs: loaded.logs, geminiCalls };
 }
 
 test("a row with no Transaction ID is given one, sent with it, and written back", () => {
@@ -772,19 +775,96 @@ test("only rows about to be sent get an id; categorized rows and rows with ids a
   assert.strictEqual(sheet.data[n - 2][HEADERS.indexOf("Transaction ID")], "EXISTING");
 });
 
-test("ids are assigned only within the batch the query will return", () => {
+test("a row past the first batch gets its id only when its own batch starts", () => {
   // 50 uncategorized rows that already have ids come first, so the id-less row
-  // after them is not in this run's batch and must not be given an id yet.
+  // after them is not in the first batch; it is given an id for the second.
   const rows = HISTORY.map((r) => r.slice());
   for (let i = 0; i < 50; i++) {
     rows.push([new Date(2023, 8, 25), "", "", -1, "ROW " + i, "ID" + i, ""]);
   }
   rows.push([new Date(2023, 8, 25), "", "", -1, "LATER NO ID", "", ""]);
-  const { sheet } = liveRun(rows, (t) => ({
+  const { sheet, logs, geminiCalls } = liveRun(rows, (t) => ({
     transaction_id: t.transaction_id,
     updated_description: "x",
     category: "to-be-categorized",
   }));
-  assert.strictEqual(sheet.writes.filter((w) => w.column === "Transaction ID").length, 0);
-  assert.strictEqual(sheet.data[sheet.data.length - 1][HEADERS.indexOf("Transaction ID")], "");
+  const strings = logs.filter((l) => typeof l === "string");
+  const batch1Write = strings.indexOf("Writing Gemini's answers into your sheet...");
+  const assigned = strings.findIndex((l) => l.startsWith("Assigned a Transaction ID to 1 row(s)"));
+  const batch2 = strings.indexOf("--- Batch 2 ---");
+  assert.ok(batch1Write < assigned && assigned < batch2);
+  assert.strictEqual(geminiCalls.length, 2);
+  assert.strictEqual(geminiCalls[1].length, 1);
+  assert.match(sheet.data[sheet.data.length - 1][HEADERS.indexOf("Transaction ID")], /^autocat:/);
+});
+
+// --- Looping over batches ---------------------------------------------------
+
+function manyRows(n) {
+  const rows = HISTORY.map((r) => r.slice());
+  for (let i = 0; i < n; i++) {
+    rows.push([new Date(2023, 8, 25), "", "", -1, "ROW " + i, "ID" + i, ""]);
+  }
+  return rows;
+}
+
+const answerAll = (t) => ({
+  transaction_id: t.transaction_id,
+  updated_description: "x",
+  category: "Restaurants",
+});
+
+test("a run works through several batches until nothing is left", () => {
+  const { sheet, geminiCalls, logs } = liveRun(manyRows(120), answerAll);
+  assert.deepStrictEqual(geminiCalls.map((c) => c.length), [50, 50, 20]);
+  const cat = HEADERS.indexOf("Category");
+  assert.strictEqual(sheet.data.slice(1).filter((r) => r[cat] === "").length, 0);
+  assert.ok(logs.some((l) => typeof l === "object" && l.batches === 3 && l.answersWritten === 120));
+});
+
+test("a run stops starting batches when the next would overrun the time budget", () => {
+  // Each batch takes 100s on this clock; with a 250s budget, after two batches
+  // (200s) another would end at 300s, so the run stops.
+  let clock = 0;
+  const now = () => clock;
+  const { geminiCalls, logs } = liveRun(
+    manyRows(200),
+    (t) => {
+      clock += 100000 / 50;
+      return answerAll(t);
+    },
+    { budgetMs: 250000, now }
+  );
+  assert.strictEqual(geminiCalls.length, 2);
+  assert.ok(logs.includes("Stopping before batch 3 to stay within 250s; run again for the rest."));
+});
+
+test("the default budget is five minutes, and a trigger's event object is ignored", () => {
+  const { context } = loadScripts(SOURCES);
+  assert.strictEqual(require("vm").runInContext("RUN_TIME_BUDGET_MS", context), 300000);
+  // A time-driven trigger passes an event object; the run must still go.
+  const { geminiCalls } = liveRun(manyRows(3), answerAll, { authMode: "FULL", triggerUid: "1" });
+  assert.strictEqual(geminiCalls.length, 1);
+});
+
+test("a run stops when Gemini fails rather than retrying the same rows", () => {
+  const { geminiCalls, logs } = liveRun(manyRows(120), answerAll, undefined, { geminiFails: true });
+  assert.strictEqual(geminiCalls.length, 1);
+  assert.ok(logs.includes("Stopping: the Gemini call failed."));
+});
+
+test("rows that cannot be written are not sent again in the same run", () => {
+  // Gemini answers with ids that are not on the sheet, so nothing is written
+  // and the same 50 rows come back from the query.
+  const { geminiCalls, logs } = liveRun(manyRows(60), (t) => ({
+    transaction_id: "MISSING-" + t.transaction_id,
+    updated_description: "x",
+    category: "Restaurants",
+  }));
+  assert.deepStrictEqual(geminiCalls.map((c) => c.length), [50]);
+  assert.ok(
+    logs.includes(
+      "50 uncategorized transaction(s) were already tried in this run and could not be written; stopping."
+    )
+  );
 });

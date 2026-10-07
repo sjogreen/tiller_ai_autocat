@@ -99,19 +99,100 @@ const FALLBACK_CATEGORY = "To Be Categorized";
 
 // Other Misc Paramaters
 const MAX_BATCH_SIZE = 50;
+// A run keeps starting batches only while the next is expected to finish within
+// this. Apps Script stops a run at 6 minutes; this leaves a minute to spare.
+const RUN_TIME_BUDGET_MS = 5 * 60 * 1000;
 var TRANSACTION_SEARCHER = null;
 
-function categorizeUncategorizedTransactions() {
-  assignMissingTransactionIds();
-  var uncategorizedTransactions = getTransactionsToCategorize();
+/**
+ * Categorizes uncategorized transactions in batches of up to MAX_BATCH_SIZE,
+ * starting another batch only while it is expected to finish within
+ * RUN_TIME_BUDGET_MS (Apps Script stops a run at 6 minutes). Each batch writes
+ * its results before the next starts, so a run that is stopped keeps what it
+ * finished.
+ *
+ * A row already tried in this run is not sent again in it - for instance one
+ * whose answer could not be written - and the run stops when a batch holds
+ * nothing new, or when the Gemini call fails.
+ *
+ * @param {Object=} options For tests: {budgetMs, now}. Apps Script passes an
+ *     event object when this runs from a trigger; anything else is ignored.
+ */
+function categorizeUncategorizedTransactions(options) {
+  var opts = options && typeof options.budgetMs === "number" ? options : {};
+  var now = typeof opts.now === "function" ? opts.now : function () {
+    return Date.now();
+  };
+  var budgetMs = typeof opts.budgetMs === "number" ? opts.budgetMs : RUN_TIME_BUDGET_MS;
 
-  var numTxnsToCategorize = uncategorizedTransactions.length;
-  if (numTxnsToCategorize == 0) {
-    Logger.log("No uncategorized transactions found");
-    return;
+  var started = now();
+  var longestBatchMs = 0;
+  var tried = Object.create(null);
+  var categoryList = getAllowedCategories();
+  var batches = 0;
+  var categorized = 0;
+
+  for (;;) {
+    var batchStarted = now();
+
+    assignMissingTransactionIds();
+    var fetched = getTransactionsToCategorize();
+    var batch = fetched.filter(function (t) {
+      return !tried[t.transaction_id];
+    });
+
+    if (batch.length === 0) {
+      if (batches === 0) Logger.log("No uncategorized transactions found");
+      else if (fetched.length > 0) {
+        Logger.log(
+          fetched.length + " uncategorized transaction(s) were already tried in this run " +
+            "and could not be written; stopping."
+        );
+      }
+      break;
+    }
+
+    batches++;
+    batch.forEach(function (t) {
+      tried[t.transaction_id] = true;
+    });
+    Logger.log("--- Batch " + batches + " ---");
+    var result = categorizeBatch(batch, categoryList);
+    categorized += result.written;
+
+    longestBatchMs = Math.max(longestBatchMs, now() - batchStarted);
+    if (result.geminiFailed) {
+      Logger.log("Stopping: the Gemini call failed.");
+      break;
+    }
+    if (fetched.length < MAX_BATCH_SIZE) break; // that was the last of them
+    if (now() - started + longestBatchMs > budgetMs) {
+      Logger.log(
+        "Stopping before batch " + (batches + 1) + " to stay within " +
+          Math.round(budgetMs / 1000) + "s; run again for the rest."
+      );
+      break;
+    }
   }
 
-  Logger.log("Found " + numTxnsToCategorize + " transactions to categorize");
+  if (batches > 0) {
+    Logger.log({
+      batches: batches,
+      answersWritten: categorized,
+      elapsedSeconds: Math.round((now() - started) / 1000),
+    });
+  }
+}
+
+/**
+ * One batch through the pipeline: find previous transactions, ask Jev (if
+ * configured) and write its matches, then ask Gemini about the rest and write
+ * its answers.
+ *
+ * @returns {{written: number, geminiFailed: boolean}}
+ */
+function categorizeBatch(uncategorizedTransactions, categoryList) {
+  Logger.log("Found " + uncategorizedTransactions.length + " transactions to categorize");
   Logger.log("Looking for historical similar transactions...");
 
   var transactionList = [];
@@ -134,8 +215,6 @@ function categorizeUncategorizedTransactions() {
     "Processing this set of transactions and similar transactions:"
   );
   Logger.log(transactionList);
-
-  var categoryList = getAllowedCategories();
 
   // Stage 1 (optional): Jev settles the transactions that match a previous one.
   var byPrecedent = {
@@ -188,6 +267,7 @@ function categorizeUncategorizedTransactions() {
   });
 
   var byGemini = [];
+  var geminiFailed = false;
   if (remaining.length > 0) {
     Logger.log(
       "Using Gemini (" + GEMINI_MODEL + ") on Vertex AI for " +
@@ -201,6 +281,7 @@ function categorizeUncategorizedTransactions() {
       // Jev's matches are already written; the rest stay uncategorized for the
       // next run.
       byGemini = [];
+      geminiFailed = true;
     } else {
       Logger.log(
         "Gemini returned the following sugested categories and descriptions:"
@@ -217,6 +298,11 @@ function categorizeUncategorizedTransactions() {
   if (byPrecedent.suggestions.length > 0 || byGemini.length > 0) {
     Logger.log("Finished updating your sheet!");
   }
+
+  return {
+    written: byPrecedent.suggestions.length + byGemini.length,
+    geminiFailed: geminiFailed,
+  };
 }
 
 /**
