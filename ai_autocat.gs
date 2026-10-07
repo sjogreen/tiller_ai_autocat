@@ -239,7 +239,17 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
   );
   if (openRouterKey) {
     Logger.log("Asking Jev (" + JEV_MODEL + ") which previous transaction matches...");
-    byPrecedent = askPrecedents(transactionList, categoryList, openRouterKey);
+    // Each group of parallel Jev requests is written as soon as it comes back,
+    // so a run that is stopped keeps every match it got.
+    byPrecedent = askPrecedents(
+      transactionList,
+      categoryList,
+      openRouterKey,
+      function (matches) {
+        Logger.log("Writing " + matches.length + " Jev match(es) into your sheet...");
+        writeUpdatedTransactions(matches, categoryList);
+      }
+    );
     Logger.log({
       jevAsked: byPrecedent.asked,
       jevTaken: byPrecedent.taken,
@@ -259,13 +269,6 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
     }
   }
 
-  // Write Jev's answers now, so they are saved even if the Gemini call fails
-  // or the run is cut off.
-  if (byPrecedent.suggestions.length > 0) {
-    Logger.log("Writing Jev's matches into your sheet...");
-    writeUpdatedTransactions(byPrecedent.suggestions, categoryList);
-  }
-
   // Stage 2: Gemini answers for everything Jev did not settle.
   var taken = Object.create(null);
   byPrecedent.suggestions.forEach(function (s) {
@@ -282,9 +285,14 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       "Using Gemini (" + GEMINI_MODEL + ") on Vertex AI for " +
         remaining.length + " transaction(s)"
     );
+    // Likewise each group of parallel Gemini requests is written as it returns.
     var gemini = lookupDescAndCategoryGemini(
       remaining,
-      getPromptCategories(categoryList)
+      getPromptCategories(categoryList),
+      function (answers) {
+        Logger.log("Writing " + answers.length + " Gemini answer(s) into your sheet...");
+        writeUpdatedTransactions(answers, categoryList);
+      }
     );
     byGemini = gemini.answers;
     if (gemini.failedRequests > 0) {
@@ -301,11 +309,6 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       );
       Logger.log(byGemini);
     }
-  }
-
-  if (byGemini.length > 0) {
-    Logger.log("Writing Gemini's answers into your sheet...");
-    writeUpdatedTransactions(byGemini, categoryList);
   }
 
   if (byPrecedent.suggestions.length > 0 || byGemini.length > 0) {
@@ -1022,9 +1025,12 @@ function jevDecision(transaction, answer, taken) {
  *
  * A failed request is counted and that transaction falls through to Gemini.
  *
+ * onMatches (optional) is called with each group's matches as soon as that
+ * group of requests returns, so they can be written right away.
+ *
  * @returns {{suggestions: Array, asked: number, taken: number, failed: number, cost: number}}
  */
-function askPrecedents(transactionList, categoryList, apiKey) {
+function askPrecedents(transactionList, categoryList, apiKey, onMatches) {
   var candidates = transactionList.filter(function (t) {
     return t.previous_transactions && t.previous_transactions.length > 0;
   });
@@ -1048,6 +1054,7 @@ function askPrecedents(transactionList, categoryList, apiKey) {
       })
     );
 
+    var chunkMatches = [];
     for (var i = 0; i < chunk.length; i++) {
       var json = null;
       try {
@@ -1074,13 +1081,16 @@ function askPrecedents(transactionList, categoryList, apiKey) {
         categoryList.includes(picked.category);
       decisions.push(jevDecision(chunk[i], answer, take));
       if (take) {
-        suggestions.push({
+        chunkMatches.push({
           transaction_id: chunk[i].transaction_id,
           updated_description: displayDescription(picked),
           category: picked.category,
         });
       }
     }
+
+    suggestions = suggestions.concat(chunkMatches);
+    if (onMatches && chunkMatches.length > 0) onMatches(chunkMatches);
   }
 
   return {
@@ -1247,11 +1257,12 @@ function geminiPayload(transactionList, promptCategories) {
  * Asks Gemini on Vertex AI for a description and category for each
  * transaction: GEMINI_ROWS_PER_REQUEST to a request, GEMINI_CONCURRENCY
  * requests at a time. A request that fails is logged and its rows are left
- * out; the rest still come back.
+ * out; the rest still come back. onAnswers (optional) is called with each
+ * group's answers as soon as that group returns.
  *
  * @returns {{answers: Array, failedRequests: number, requests: number}}
  */
-function lookupDescAndCategoryGemini(transactionList, promptCategories) {
+function lookupDescAndCategoryGemini(transactionList, promptCategories, onAnswers) {
   const projectId = PropertiesService.getScriptProperties().getProperty(
     GCP_PROJECT_ID_PROPERTY
   );
@@ -1302,14 +1313,17 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories) {
     );
     var elapsedTime = new Date().getTime() - startTime;
 
+    var groupAnswers = [];
     for (var i = 0; i < group.length; i++) {
       var parsed = parseGeminiResponse(responses[i], group[i].length, elapsedTime);
       if (parsed === null) {
         failedRequests++;
       } else {
-        answers = answers.concat(parsed);
+        groupAnswers = groupAnswers.concat(parsed);
       }
     }
+    answers = answers.concat(groupAnswers);
+    if (onAnswers && groupAnswers.length > 0) onAnswers(groupAnswers);
   }
 
   return {

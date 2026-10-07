@@ -683,9 +683,9 @@ test("Jev's matches are written before Gemini is called, then Gemini's in a seco
   assert.ok(written.N1 && written.N2 && written.N3);
 
   const order = logs.filter((l) => typeof l === "string");
-  const jevWrite = order.indexOf("Writing Jev's matches into your sheet...");
+  const jevWrite = order.indexOf("Writing 2 Jev match(es) into your sheet...");
   const geminiAsk = order.findIndex((l) => l.startsWith("Using Gemini"));
-  const geminiWrite = order.indexOf("Writing Gemini's answers into your sheet...");
+  const geminiWrite = order.indexOf("Writing 1 Gemini answer(s) into your sheet...");
   assert.ok(jevWrite !== -1 && jevWrite < geminiAsk && geminiAsk < geminiWrite);
   const rows = HISTORY.length + NEW_ROWS.length;
   assert.deepStrictEqual(
@@ -812,7 +812,7 @@ test("a row past the first batch gets its id only when its own batch starts", ()
     category: "to-be-categorized",
   }));
   const strings = logs.filter((l) => typeof l === "string");
-  const batch1Write = strings.indexOf("Writing Gemini's answers into your sheet...");
+  const batch1Write = strings.findIndex((l) => /^Writing \d+ Gemini answer\(s\)/.test(l));
   const assigned = strings.findIndex((l) => l.startsWith("Assigned a Transaction ID to 1 row(s)"));
   const batch2 = strings.indexOf("--- Batch 2 ---");
   assert.ok(batch1Write < assigned && assigned < batch2);
@@ -916,4 +916,83 @@ test("rows that cannot be written are not sent again in the same run", () => {
       B + " uncategorized transaction(s) were already tried in this run and could not be written; stopping."
     )
   );
+});
+
+test("Jev's matches are written after each group of parallel requests", () => {
+  // 70 rows with a previous transaction: Jev groups of 32, 32 and 6, each
+  // written before the next group is sent.
+  const many = [];
+  for (let i = 0; i < 70; i++) {
+    many.push(["M" + i, "SAFEWAY #" + (2000 + i) + " SAN FRANCISCO CA", -1, "Date(2026,9,1)"]);
+  }
+  const rows = HISTORY.map((r) => r.slice()).concat(
+    many.map((n) => {
+      const row = new Array(HEADERS.length).fill("");
+      row[HEADERS.indexOf("Transaction ID")] = n[0];
+      row[HEADERS.indexOf("Full Description")] = n[1];
+      return row;
+    })
+  );
+  const sheet = new FakeSheet("Transactions", HEADERS, rows);
+  const spreadsheet = new FakeSpreadsheet({
+    Transactions: sheet,
+    Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
+  });
+  const writtenBeforeGroup = [];
+  const { context, logs } = loadScripts(SOURCES, {
+    spreadsheet,
+    scriptProperties: { GCP_PROJECT_ID: "proj", OPENROUTER_API_KEY: "k" },
+    fetch: () => ({ getContentText: () => gvizResponse(many) }),
+    fetchAll: (requests) => {
+      writtenBeforeGroup.push(new Set(sheet.writes.map((w) => w.row)).size);
+      return requests.map(() => jevAnswer("p1", 0.0));
+    },
+  });
+  context.categorizeUncategorizedTransactions();
+  assert.deepStrictEqual(writtenBeforeGroup, [0, 32, 64]);
+  assert.deepStrictEqual(
+    logs.filter((l) => typeof l === "string" && l.includes("Jev match(es)")),
+    [
+      "Writing 32 Jev match(es) into your sheet...",
+      "Writing 32 Jev match(es) into your sheet...",
+      "Writing 6 Jev match(es) into your sheet...",
+    ]
+  );
+});
+
+test("Gemini's answers are written after each group of parallel requests", () => {
+  // A full batch goes to Gemini in requests of 50, three at a time; each
+  // group's answers are in the sheet before the next group is sent.
+  const rows = manyRows(330);
+  const sheet = new FakeSheet("Transactions", HEADERS, rows);
+  const spreadsheet = new FakeSpreadsheet({
+    Transactions: sheet,
+    Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
+  });
+  const col = (name) => HEADERS.indexOf(name);
+  const pending = () =>
+    sheet.data
+      .slice(1)
+      .filter((r) => r[col("Full Description")] !== "" && r[col("Category")] === "");
+  const writtenBeforeGroup = [];
+  let firstPending = null;
+  const { context } = loadScripts(SOURCES, {
+    spreadsheet,
+    scriptProperties: { GCP_PROJECT_ID: "proj" },
+    fetch: (url) => {
+      const batch = pending().slice(0, B).map((r) => [r[col("Transaction ID")], r[col("Full Description")], -1, "Date(2023,8,25)"]);
+      return { getContentText: () => gvizResponse(batch) };
+    },
+    fetchAll: (requests) => {
+      if (firstPending === null) firstPending = pending().length;
+      writtenBeforeGroup.push(firstPending - pending().length);
+      return requests.map((r) => {
+        const payload = JSON.parse(JSON.parse(r.payload).contents[0].parts[0].text);
+        return geminiResponse(payload.transactions.map(answerAll));
+      });
+    },
+  });
+  context.categorizeUncategorizedTransactions();
+  // Batch 1 is B rows: groups of 3, 2 requests (150, 100 rows).
+  assert.deepStrictEqual(writtenBeforeGroup.slice(0, 2), [0, 150]);
 });
