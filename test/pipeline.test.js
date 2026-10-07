@@ -996,3 +996,67 @@ test("Gemini's answers are written after each group of parallel requests", () =>
   // Batch 1 is B rows: groups of 3, 2 requests (150, 100 rows).
   assert.deepStrictEqual(writtenBeforeGroup.slice(0, 2), [0, 150]);
 });
+
+// --- Timing and the missing-id scan -----------------------------------------
+
+test("each batch and the run log where their time went", () => {
+  // Gemini takes 4s per request on this clock; nothing else takes time.
+  let clock = 0;
+  const { logs } = liveRun(
+    manyRows(200),
+    (t) => {
+      clock += 4000 / 50;
+      return answerAll(t);
+    },
+    { budgetMs: 300000, now: () => clock }
+  );
+  // 200 rows: a group of three 50-row requests (12s), written, then one more (4s).
+  const batch = logs.find((l) => typeof l === "string" && l.startsWith("Batch 1 timing"));
+  assert.strictEqual(batch, "Batch 1 timing (200 rows): 16.0s total: Gemini requests 16.0s");
+  const run = logs.find((l) => typeof l === "string" && l.startsWith("Run timing"));
+  assert.strictEqual(
+    run,
+    "Run timing: 16.0s total: Gemini requests 16.0s; first answer written after 12.0s"
+  );
+});
+
+test("the sheet is scanned for missing ids only when the query returns a row without one", () => {
+  const rows = manyRows(5);
+  let scans = 0;
+  const sheet = new FakeSheet("Transactions", HEADERS, rows);
+  const spreadsheet = new FakeSpreadsheet({
+    Transactions: sheet,
+    Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
+  });
+  const col = (name) => HEADERS.indexOf(name);
+  const { context } = loadScripts(SOURCES, {
+    spreadsheet,
+    scriptProperties: { GCP_PROJECT_ID: "proj" },
+    fetch: (url, params) => {
+      if (url.includes("/gviz/")) {
+        const batch = sheet.data
+          .slice(1)
+          .filter((r) => r[col("Full Description")] !== "" && r[col("Category")] === "")
+          .map((r) => [r[col("Transaction ID")] || null, r[col("Full Description")], -1, "Date(2023,8,25)"]);
+        return { getContentText: () => gvizResponse(batch) };
+      }
+      const payload = JSON.parse(JSON.parse(params.payload).contents[0].parts[0].text);
+      return geminiResponse(payload.transactions.map(answerAll));
+    },
+  });
+  const original = context.assignMissingTransactionIds;
+  context.assignMissingTransactionIds = function () {
+    scans++;
+    return original();
+  };
+  context.categorizeUncategorizedTransactions();
+  assert.strictEqual(scans, 0, "every row had an id, so no scan");
+
+  // Now a row without an id: one scan, and it is written like the others.
+  sheet.data.push([new Date(2023, 8, 25), "", "", -1, "NO ID ROW", "", ""]);
+  context.categorizeUncategorizedTransactions();
+  assert.strictEqual(scans, 1);
+  const last = sheet.data[sheet.data.length - 1];
+  assert.match(last[col("Transaction ID")], /^autocat:/);
+  assert.strictEqual(last[col("Category")], "Restaurants");
+});

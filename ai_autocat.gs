@@ -113,6 +113,73 @@ const GEMINI_CONCURRENCY = 3;
 const RUN_TIME_BUDGET_MS = 5 * 60 * 1000;
 var TRANSACTION_SEARCHER = null;
 
+// --- Timing ------------------------------------------------------------------
+// Where a run's time goes, logged per batch and for the whole run. Each phase
+// accumulates the milliseconds spent inside timed(phase, fn).
+var RUN_TIMING = null;
+
+// The phases, in the order they happen, with the label used in the log.
+const TIMING_PHASES = [
+  ["categories", "category list"],
+  ["query", "find uncategorized"],
+  ["assignIds", "assign missing ids"],
+  ["searchIndex", "build search index"],
+  ["similarSearch", "find previous transactions"],
+  ["jevRequests", "Jev requests"],
+  ["jevWrites", "write Jev matches"],
+  ["geminiRequests", "Gemini requests"],
+  ["geminiWrites", "write Gemini answers"],
+  ["logging", "logging"],
+];
+
+function startTiming(now) {
+  RUN_TIMING = { now: now, started: now(), phases: {}, firstWriteMs: null };
+}
+
+function timed(phase, fn) {
+  if (!RUN_TIMING) return fn();
+  var start = RUN_TIMING.now();
+  try {
+    return fn();
+  } finally {
+    RUN_TIMING.phases[phase] =
+      (RUN_TIMING.phases[phase] || 0) + (RUN_TIMING.now() - start);
+  }
+}
+
+// Records when the first answer of the run reached the sheet.
+function noteFirstWrite() {
+  if (RUN_TIMING && RUN_TIMING.firstWriteMs === null) {
+    RUN_TIMING.firstWriteMs = RUN_TIMING.now() - RUN_TIMING.started;
+  }
+}
+
+function timingSnapshot() {
+  var copy = {};
+  if (RUN_TIMING) {
+    for (var k in RUN_TIMING.phases) copy[k] = RUN_TIMING.phases[k];
+  }
+  return copy;
+}
+
+// "label 1.2s, label 0.4s, ..." for the phases that took any time between two
+// snapshots, plus whatever was not inside a timed phase.
+function describeTiming(before, after, elapsedMs) {
+  var seconds = function (ms) {
+    return (Math.round(ms / 100) / 10).toFixed(1) + "s";
+  };
+  var parts = [];
+  var accounted = 0;
+  TIMING_PHASES.forEach(function (phase) {
+    var ms = (after[phase[0]] || 0) - (before[phase[0]] || 0);
+    accounted += ms;
+    if (ms > 0) parts.push(phase[1] + " " + seconds(ms));
+  });
+  var other = elapsedMs - accounted;
+  if (other > 0) parts.push("other " + seconds(other));
+  return seconds(elapsedMs) + " total: " + parts.join(", ");
+}
+
 /**
  * Categorizes uncategorized transactions in batches of up to MAX_BATCH_SIZE,
  * starting another batch only while it is expected to finish within
@@ -134,18 +201,28 @@ function categorizeUncategorizedTransactions(options) {
   };
   var budgetMs = typeof opts.budgetMs === "number" ? opts.budgetMs : RUN_TIME_BUDGET_MS;
 
+  startTiming(now);
   var started = now();
   var longestBatchMs = 0;
   var tried = Object.create(null);
-  var categoryList = getAllowedCategories();
+  var categoryList = timed("categories", getAllowedCategories);
   var batches = 0;
   var categorized = 0;
 
   for (;;) {
     var batchStarted = now();
+    var timingBefore = timingSnapshot();
 
-    assignMissingTransactionIds();
-    var fetched = getTransactionsToCategorize();
+    var fetched = timed("query", getTransactionsToCategorize);
+    // Rows with no Transaction ID get one before they are sent; only then is
+    // the sheet scanned for them, and the query is re-run to pick up the ids.
+    var missingIds = fetched.some(function (t) {
+      return t.transaction_id === null || t.transaction_id === undefined ||
+        t.transaction_id === "";
+    });
+    if (missingIds && timed("assignIds", assignMissingTransactionIds) > 0) {
+      fetched = timed("query", getTransactionsToCategorize);
+    }
     var batch = fetched.filter(function (t) {
       return !tried[t.transaction_id];
     });
@@ -169,7 +246,12 @@ function categorizeUncategorizedTransactions(options) {
     var result = categorizeBatch(batch, categoryList);
     categorized += result.written;
 
-    longestBatchMs = Math.max(longestBatchMs, now() - batchStarted);
+    var batchMs = now() - batchStarted;
+    longestBatchMs = Math.max(longestBatchMs, batchMs);
+    Logger.log(
+      "Batch " + batches + " timing (" + batch.length + " rows): " +
+        describeTiming(timingBefore, timingSnapshot(), batchMs)
+    );
     if (result.geminiFailed) {
       Logger.log("Stopping: the Gemini call failed.");
       break;
@@ -190,7 +272,15 @@ function categorizeUncategorizedTransactions(options) {
       answersWritten: categorized,
       elapsedSeconds: Math.round((now() - started) / 1000),
     });
+    Logger.log(
+      "Run timing: " + describeTiming({}, timingSnapshot(), now() - started) +
+        (RUN_TIMING.firstWriteMs !== null
+          ? "; first answer written after " +
+            (Math.round(RUN_TIMING.firstWriteMs / 100) / 10).toFixed(1) + "s"
+          : "")
+    );
   }
+  RUN_TIMING = null;
 }
 
 /**
@@ -220,10 +310,12 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
     transactionList.push(entry);
   }
 
-  Logger.log(
-    "Processing this set of transactions and similar transactions:"
-  );
-  Logger.log(transactionList);
+  timed("logging", function () {
+    Logger.log(
+      "Processing this set of transactions and similar transactions:"
+    );
+    Logger.log(transactionList);
+  });
 
   // Stage 1 (optional): Jev settles the transactions that match a previous one.
   var byPrecedent = {
@@ -247,7 +339,9 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       openRouterKey,
       function (matches) {
         Logger.log("Writing " + matches.length + " Jev match(es) into your sheet...");
-        writeUpdatedTransactions(matches, categoryList);
+        timed("jevWrites", function () {
+          writeUpdatedTransactions(matches, categoryList);
+        });
       }
     );
     Logger.log({
@@ -256,17 +350,19 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       jevFailed: byPrecedent.failed,
       jevCost: byPrecedent.cost,
     });
-    if (byPrecedent.decisions.length > 0) {
-      // One line per transaction asked: what Jev chose, the probability that
-      // some option matches (1 - P(none), the number the take threshold is
-      // checked against), Jev's own confidence, and whether it was taken.
-      Logger.log("Jev decisions:");
-      Logger.log(byPrecedent.decisions);
-    }
-    if (byPrecedent.suggestions.length > 0) {
-      Logger.log("Jev matched these to a previous transaction:");
-      Logger.log(byPrecedent.suggestions);
-    }
+    timed("logging", function () {
+      if (byPrecedent.decisions.length > 0) {
+        // One line per transaction asked: what Jev chose, the probability that
+        // some option matches (1 - P(none), the number the take threshold is
+        // checked against), Jev's own confidence, and whether it was taken.
+        Logger.log("Jev decisions:");
+        Logger.log(byPrecedent.decisions);
+      }
+      if (byPrecedent.suggestions.length > 0) {
+        Logger.log("Jev matched these to a previous transaction:");
+        Logger.log(byPrecedent.suggestions);
+      }
+    });
   }
 
   // Stage 2: Gemini answers for everything Jev did not settle.
@@ -291,7 +387,9 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       getPromptCategories(categoryList),
       function (answers) {
         Logger.log("Writing " + answers.length + " Gemini answer(s) into your sheet...");
-        writeUpdatedTransactions(answers, categoryList);
+        timed("geminiWrites", function () {
+          writeUpdatedTransactions(answers, categoryList);
+        });
       }
     );
     byGemini = gemini.answers;
@@ -304,10 +402,12 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       geminiFailed = true;
     }
     if (byGemini.length > 0) {
-      Logger.log(
-        "Gemini returned the following sugested categories and descriptions:"
-      );
-      Logger.log(byGemini);
+      timed("logging", function () {
+        Logger.log(
+          "Gemini returned the following sugested categories and descriptions:"
+        );
+        Logger.log(byGemini);
+      });
     }
   }
 
@@ -593,16 +693,20 @@ function closestByAmount(hits, amount, slots) {
 
 function findSimilarTransactions(originalDescription, amount) {
   if (TRANSACTION_SEARCHER === null) {
-    TRANSACTION_SEARCHER = createSearchIndexWithStandardColumns({
-      minTermSize: 3,
+    TRANSACTION_SEARCHER = timed("searchIndex", function () {
+      return createSearchIndexWithStandardColumns({
+        minTermSize: 3,
+      });
     });
   }
 
-  const results = closestByAmount(
-    TRANSACTION_SEARCHER.search(originalDescription, PRECEDENT_CANDIDATES),
-    typeof amount === "number" ? amount : 0,
-    EXAMPLES_PER_ROW
-  );
+  const results = timed("similarSearch", function () {
+    return closestByAmount(
+      TRANSACTION_SEARCHER.search(originalDescription, PRECEDENT_CANDIDATES),
+      typeof amount === "number" ? amount : 0,
+      EXAMPLES_PER_ROW
+    );
+  });
 
   var previousTransactionList = [];
   results.forEach(function (result, index) {
@@ -859,6 +963,7 @@ function writeUpdatedTransactions(transactionList, categoryList) {
     }
   }
 
+  noteFirstWrite();
   Logger.log(
     "Success: Updated " +
       numFound +
@@ -1041,7 +1146,8 @@ function askPrecedents(transactionList, categoryList, apiKey, onMatches) {
 
   for (var at = 0; at < candidates.length; at += JEV_CONCURRENCY) {
     var chunk = candidates.slice(at, at + JEV_CONCURRENCY);
-    var responses = UrlFetchApp.fetchAll(
+    var responses = timed("jevRequests", function () {
+      return UrlFetchApp.fetchAll(
       chunk.map(function (t) {
         return {
           url: JEV_URL,
@@ -1052,7 +1158,8 @@ function askPrecedents(transactionList, categoryList, apiKey, onMatches) {
           muteHttpExceptions: true,
         };
       })
-    );
+      );
+    });
 
     var chunkMatches = [];
     for (var i = 0; i < chunk.length; i++) {
@@ -1306,11 +1413,13 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories, onAnswer
   for (var g = 0; g < chunks.length; g += GEMINI_CONCURRENCY) {
     var group = chunks.slice(g, g + GEMINI_CONCURRENCY);
     var startTime = new Date().getTime();
-    var responses = UrlFetchApp.fetchAll(
-      group.map(function (chunk) {
-        return geminiFetchRequest(url, chunk, promptCategories);
-      })
-    );
+    var responses = timed("geminiRequests", function () {
+      return UrlFetchApp.fetchAll(
+        group.map(function (chunk) {
+          return geminiFetchRequest(url, chunk, promptCategories);
+        })
+      );
+    });
     var elapsedTime = new Date().getTime() - startTime;
 
     var groupAnswers = [];
