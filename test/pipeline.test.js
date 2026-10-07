@@ -442,7 +442,7 @@ test("Jev picks are still written when the Gemini call fails", () => {
   assert.strictEqual(written.N3, undefined);
 });
 
-test("Jev requests go out at most 32 at a time", () => {
+test("Jev requests go out at most 16 at a time", () => {
   const many = [];
   for (let i = 0; i < 70; i++) {
     many.push(["M" + i, "SAFEWAY #" + (2000 + i) + " SAN FRANCISCO CA", -1, "Date(2026,9,1)"]);
@@ -470,7 +470,7 @@ test("Jev requests go out at most 32 at a time", () => {
     },
   });
   context.categorizeUncategorizedTransactions();
-  assert.deepStrictEqual(batchSizes, [32, 32, 6]);
+  assert.deepStrictEqual(batchSizes, [16, 16, 16, 16, 6]);
 });
 
 // --- Choosing previous transactions by amount -------------------------------
@@ -919,8 +919,8 @@ test("rows that cannot be written are not sent again in the same run", () => {
 });
 
 test("Jev's matches are written after each group of parallel requests", () => {
-  // 70 rows with a previous transaction: Jev groups of 32, 32 and 6, each
-  // written before the next group is sent.
+  // 70 rows with a previous transaction: Jev groups of 16, 16, 16, 16 and 6,
+  // each written before the next group is sent.
   const many = [];
   for (let i = 0; i < 70; i++) {
     many.push(["M" + i, "SAFEWAY #" + (2000 + i) + " SAN FRANCISCO CA", -1, "Date(2026,9,1)"]);
@@ -949,14 +949,10 @@ test("Jev's matches are written after each group of parallel requests", () => {
     },
   });
   context.categorizeUncategorizedTransactions();
-  assert.deepStrictEqual(writtenBeforeGroup, [0, 32, 64]);
+  assert.deepStrictEqual(writtenBeforeGroup, [0, 16, 32, 48, 64]);
   assert.deepStrictEqual(
     logs.filter((l) => typeof l === "string" && l.includes("Jev match(es)")),
-    [
-      "Writing 32 Jev match(es) into your sheet...",
-      "Writing 32 Jev match(es) into your sheet...",
-      "Writing 6 Jev match(es) into your sheet...",
-    ]
+    [16, 16, 16, 16, 6].map((n) => "Writing " + n + " Jev match(es) into your sheet...")
   );
 });
 
@@ -1126,4 +1122,24 @@ test("the index query and the index build are timed separately", () => {
   assert.strictEqual(line, "Batch 1 timing (3 rows): 2.5s total: query previous transactions 2.5s");
   const labels = require("vm").runInContext("TIMING_PHASES", context).map((p) => p[1]);
   assert.ok(labels.includes("query previous transactions") && labels.includes("build search index"));
+});
+
+test("progress lines mark each step that waits on the network or the sheet", () => {
+  const { logs } = run({
+    openRouterKey: "or-key",
+    jev: () => jevAnswer("none", 0.9),
+    gemini: () => geminiResponse([]),
+  });
+  const progress = logs.filter(
+    (l) =>
+      typeof l === "string" &&
+      /^(Run started|Reading the category|Querying|Building the search|Sending )/.test(l)
+  );
+  assert.strictEqual(progress[0], "Run started.");
+  assert.strictEqual(progress[1], "Reading the category list...");
+  assert.strictEqual(progress[2], "Querying the sheet for uncategorized transactions...");
+  assert.match(progress[3], /^Querying previous transactions since \d{4}-\d{2}-\d{2}\.\.\.$/);
+  assert.strictEqual(progress[4], "Building the search index from 3 previous transaction(s)...");
+  assert.strictEqual(progress[5], "Sending Jev requests 1-2 of 2...");
+  assert.strictEqual(progress[6], "Sending Gemini requests 1-1 of 1...");
 });

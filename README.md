@@ -32,7 +32,8 @@ get an ID, and only their Transaction ID cell is written.
    This runs inside the sheet and sends nothing anywhere.
 2. **Jev (optional).** If the `OPENROUTER_API_KEY` script property is set, each
    transaction that has previous transactions is sent to TypeSafe's Jev
-   (`typesafe/jev-1.13`) through OpenRouter, 32 at a time.  Jev picks the previous
+   (`typesafe/jev-1.13`) through OpenRouter, 16 at a time, each group's
+   matches written as soon as it returns.  Jev picks the previous
    transaction that is the same merchant or recurring payment, or "none".  When
    it picks one with at most a 50% chance of "none", that transaction's
    Description and Category are copied and Gemini is not asked about it.  A pick

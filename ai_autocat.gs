@@ -56,10 +56,12 @@ const JEV_URL = 'https://openrouter.ai/api/alpha/decisions';
 // Gate on that rather than on the pick's own confidence: three previous
 // transactions from one merchant split the probability between them.
 const JEV_TAKE_THRESHOLD = 0.5;
-// Jev requests in flight at once. Throughput scales linearly to 64 with no rate
-// limiting seen; one transaction per request, since batching several into one
-// request made Jev take noticeably fewer matches.
-const JEV_CONCURRENCY = 32;
+// Jev requests in flight at once, and so how many Jev answers each sheet write
+// carries. UrlFetchApp.fetchAll returns only when its slowest request does, so
+// smaller groups get answers into the sheet sooner and more steadily; 16 trades
+// a little total time for that. One transaction per request, since batching
+// several into one request made Jev take noticeably fewer matches.
+const JEV_CONCURRENCY = 16;
 const JEV_NONE = 'none';
 const JEV_NONE_OPTION =
   'No previous transaction is the same merchant or the same recurring payment as this one';
@@ -205,9 +207,13 @@ function categorizeUncategorizedTransactions(options) {
   var budgetMs = typeof opts.budgetMs === "number" ? opts.budgetMs : RUN_TIME_BUDGET_MS;
 
   startTiming(now);
+  // Progress lines before each step that waits on the network or the sheet, so
+  // a run that stalls shows where it stopped.
+  Logger.log("Run started.");
   var started = now();
   var longestBatchMs = 0;
   var tried = Object.create(null);
+  Logger.log("Reading the category list...");
   var categoryList = timed("categories", getAllowedCategories);
   var batches = 0;
   var categorized = 0;
@@ -216,6 +222,7 @@ function categorizeUncategorizedTransactions(options) {
     var batchStarted = now();
     var timingBefore = timingSnapshot();
 
+    Logger.log("Querying the sheet for uncategorized transactions...");
     var fetched = timed("query", getTransactionsToCategorize);
     // Rows with no Transaction ID get one before they are sent; only then is
     // the sheet scanned for them, and the query is re-run to pick up the ids.
@@ -223,7 +230,9 @@ function categorizeUncategorizedTransactions(options) {
       return t.transaction_id === null || t.transaction_id === undefined ||
         t.transaction_id === "";
     });
+    if (missingIds) Logger.log("Assigning Transaction IDs to rows that have none...");
     if (missingIds && timed("assignIds", assignMissingTransactionIds) > 0) {
+      Logger.log("Querying the sheet again for uncategorized transactions...");
       fetched = timed("query", getTransactionsToCategorize);
     }
     var batch = fetched.filter(function (t) {
@@ -644,6 +653,10 @@ function createSearchIndexWithStandardColumns(options) {
     (dateLetter ? " ORDER BY " + dateLetter + " desc" : "") +
     " LIMIT " + PRECEDENT_CAP;
 
+  Logger.log(
+    "Querying previous transactions" +
+      (dateLetter ? " since " + isoDate(since) : "") + "..."
+  );
   var rows = timed("indexQuery", function () {
     return Utils.gvizQuery(
       spreadsheet.getId(),
@@ -653,6 +666,7 @@ function createSearchIndexWithStandardColumns(options) {
     );
   });
 
+  Logger.log("Building the search index from " + rows.length + " previous transaction(s)...");
   return timed("indexBuild", function () {
     return indexDocuments(rows, at, options);
   });
@@ -1192,6 +1206,10 @@ function askPrecedents(transactionList, categoryList, apiKey, onMatches) {
 
   for (var at = 0; at < candidates.length; at += JEV_CONCURRENCY) {
     var chunk = candidates.slice(at, at + JEV_CONCURRENCY);
+    Logger.log(
+      "Sending Jev requests " + (at + 1) + "-" + (at + chunk.length) +
+        " of " + candidates.length + "..."
+    );
     var responses = timed("jevRequests", function () {
       return UrlFetchApp.fetchAll(
       chunk.map(function (t) {
@@ -1458,6 +1476,10 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories, onAnswer
 
   for (var g = 0; g < chunks.length; g += GEMINI_CONCURRENCY) {
     var group = chunks.slice(g, g + GEMINI_CONCURRENCY);
+    Logger.log(
+      "Sending Gemini requests " + (g + 1) + "-" + (g + group.length) +
+        " of " + chunks.length + "..."
+    );
     var startTime = new Date().getTime();
     var responses = timed("geminiRequests", function () {
       return UrlFetchApp.fetchAll(
