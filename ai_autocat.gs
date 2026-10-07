@@ -37,9 +37,11 @@ const OUTPUT_COST_PER_M_TOKENS = 3.75;
 
 // Generation settings, matching the Compound categorizer: deterministic output,
 // as little thinking as the model allows, and a ceiling high enough that a full
-// batch is never cut off mid-answer.
+// batch is never cut off mid-answer. Compound asks for "minimal" through
+// OpenRouter, but Vertex rejects MINIMAL for gemini-3.8-flash (HTTP 400,
+// "Thinking level is unsupported"), so LOW is the least it accepts here.
 const GEMINI_TEMPERATURE = 0;
-const GEMINI_THINKING_LEVEL = 'MINIMAL';
+const GEMINI_THINKING_LEVEL = 'LOW';
 const GEMINI_MAX_OUTPUT_TOKENS = 32000;
 
 // Optional Jev stage. When an OpenRouter API key is set as the script property
@@ -135,7 +137,14 @@ function categorizeUncategorizedTransactions() {
   var categoryList = getAllowedCategories();
 
   // Stage 1 (optional): Jev settles the transactions that match a previous one.
-  var byPrecedent = { suggestions: [], asked: 0, taken: 0, failed: 0, cost: 0 };
+  var byPrecedent = {
+    suggestions: [],
+    decisions: [],
+    asked: 0,
+    taken: 0,
+    failed: 0,
+    cost: 0,
+  };
   var openRouterKey = PropertiesService.getScriptProperties().getProperty(
     OPENROUTER_API_KEY_PROPERTY
   );
@@ -148,6 +157,13 @@ function categorizeUncategorizedTransactions() {
       jevFailed: byPrecedent.failed,
       jevCost: byPrecedent.cost,
     });
+    if (byPrecedent.decisions.length > 0) {
+      // One line per transaction asked: what Jev chose, the probability that
+      // some option matches (1 - P(none), the number the take threshold is
+      // checked against), Jev's own confidence, and whether it was taken.
+      Logger.log("Jev decisions:");
+      Logger.log(byPrecedent.decisions);
+    }
     if (byPrecedent.suggestions.length > 0) {
       Logger.log("Jev matched these to a previous transaction:");
       Logger.log(byPrecedent.suggestions);
@@ -777,6 +793,29 @@ function takenPrecedent(answer, previous) {
 }
 
 /**
+ * A one-line summary of Jev's answer for the log: the raw description, the
+ * option it chose (with that option's category), the match probability
+ * 1 - P(none), Jev's confidence, and whether the pick was taken.
+ */
+function jevDecision(transaction, answer, taken) {
+  var round = function (n) {
+    return typeof n === "number" ? Math.round(n * 1000) / 1000 : null;
+  };
+  var choice = answer && typeof answer.choice === "string" ? answer.choice : "";
+  var m = /^p(\d+)$/.exec(choice);
+  var option = m ? transaction.previous_transactions[Number(m[1]) - 1] : null;
+  var none = answer && answer.probabilities && answer.probabilities[JEV_NONE];
+  return {
+    transaction_id: transaction.transaction_id,
+    description: transaction.original_description,
+    choice: choice + (option ? " (" + option.category + ")" : ""),
+    match: round(1 - (typeof none === "number" ? none : 0)),
+    confidence: round(answer && answer.confidence),
+    taken: taken,
+  };
+}
+
+/**
  * Stage 1: asks Jev, through OpenRouter, which previous transaction each
  * transaction matches. Only transactions with previous transactions are asked,
  * JEV_CONCURRENCY at a time. A pick is taken only when its category is still on
@@ -792,6 +831,7 @@ function askPrecedents(transactionList, categoryList, apiKey) {
     return t.previous_transactions && t.previous_transactions.length > 0;
   });
   var suggestions = [];
+  var decisions = [];
   var failed = 0;
   var cost = 0;
 
@@ -828,15 +868,14 @@ function askPrecedents(transactionList, categoryList, apiKey) {
 
       if (json.usage && typeof json.usage.cost === "number") cost += json.usage.cost;
 
-      var picked = takenPrecedent(
-        json.answers && json.answers.precedent,
-        chunk[i].previous_transactions
-      );
-      if (
-        picked &&
+      var answer = json.answers && json.answers.precedent;
+      var picked = takenPrecedent(answer, chunk[i].previous_transactions);
+      var take =
+        !!picked &&
         picked.category !== FALLBACK_CATEGORY &&
-        categoryList.includes(picked.category)
-      ) {
+        categoryList.includes(picked.category);
+      decisions.push(jevDecision(chunk[i], answer, take));
+      if (take) {
         suggestions.push({
           transaction_id: chunk[i].transaction_id,
           updated_description: displayDescription(picked),
@@ -848,6 +887,7 @@ function askPrecedents(transactionList, categoryList, apiKey) {
 
   return {
     suggestions: suggestions,
+    decisions: decisions,
     asked: candidates.length,
     taken: suggestions.length,
     failed: failed,

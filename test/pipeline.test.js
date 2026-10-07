@@ -245,7 +245,7 @@ test("Gemini is called with Compound's settings and a strict schema", () => {
       temperature: 0,
       maxOutputTokens: 32000,
       responseMimeType: "application/json",
-      thinkingConfig: { thinkingLevel: "MINIMAL" },
+      thinkingConfig: { thinkingLevel: "LOW" },
     }
   );
   assert.deepStrictEqual(
@@ -621,3 +621,35 @@ test("parity: keeps the text ranking when the matches do not tie", () => {
 function vmConst(context, name) {
   return require("vm").runInContext(name, context);
 }
+
+test("each Jev answer is logged with its choice, match probability and confidence", () => {
+  const { logs } = run({
+    openRouterKey: "or-key",
+    newRows: [NEW_ROWS[0], NEW_ROWS[1]],
+    jev: (req) =>
+      req.state.transaction.bank_description.startsWith("SAFEWAY")
+        ? jevAnswer("p1", 0.1)
+        : jevAnswer("none", 0.8),
+    gemini: () => geminiResponse([]),
+  });
+  const at = logs.indexOf("Jev decisions:");
+  assert.ok(at !== -1);
+  assert.deepStrictEqual(plain(logs[at + 1]), [
+    {
+      transaction_id: "N1",
+      description: "SAFEWAY #5678 SAN FRANCISCO CA",
+      choice: "p1 (Groceries)",
+      match: 0.9,
+      confidence: 0.9,
+      taken: true,
+    },
+    {
+      transaction_id: "N2",
+      description: "PG&E WEB ONLINE PAYMENT 1111111",
+      choice: "none",
+      match: 0.2,
+      confidence: 0.9,
+      taken: false,
+    },
+  ]);
+});
