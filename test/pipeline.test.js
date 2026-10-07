@@ -654,88 +654,6 @@ test("each Jev answer is logged with its choice, match probability and confidenc
   ]);
 });
 
-// --- Rows with no Transaction ID --------------------------------------------
-
-function noIdSetup(extraRows) {
-  const rows = HISTORY.map((r) => r.slice()).concat(extraRows);
-  const sheet = new FakeSheet("Transactions", HEADERS, rows);
-  const spreadsheet = new FakeSpreadsheet({
-    Transactions: sheet,
-    Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
-  });
-  return { sheet, spreadsheet };
-}
-
-test("a row with no Transaction ID is found by its contents and written", () => {
-  const krispy = (date, amount, category, id) =>
-    [date, "", category, amount, "Krispy Kreme", id, ""];
-  const { sheet, spreadsheet } = noIdSetup([
-    // Look-alikes that must not be touched: already categorized, a different
-    // amount, a different date, and one that has an id.
-    krispy(new Date(2023, 8, 25), -19.99, "Restaurants", ""),
-    krispy(new Date(2023, 8, 25), -5.0, "", ""),
-    krispy(new Date(2023, 8, 26), -19.99, "", ""),
-    krispy(new Date(2023, 8, 25), -19.99, "", "HAS-ID"),
-    // The one gviz returned.
-    krispy(new Date(2023, 8, 25), -19.99, "", ""),
-  ]);
-  const geminiCalls = [];
-  const { context, logs } = loadScripts(SOURCES, {
-    spreadsheet,
-    scriptProperties: { GCP_PROJECT_ID: "proj" },
-    fetch: (url, params) => {
-      if (url.includes("/gviz/")) {
-        return { getContentText: () => gvizResponse([[null, "Krispy Kreme", -19.99, "Date(2023,8,25)"]]) };
-      }
-      const request = JSON.parse(params.payload);
-      geminiCalls.push(request);
-      const id = JSON.parse(request.contents[0].parts[0].text).transactions[0].transaction_id;
-      return geminiResponse([{ transaction_id: id, updated_description: "Krispy Kreme", category: "Restaurants" }]);
-    },
-  });
-  context.categorizeUncategorizedTransactions();
-
-  const sent = JSON.parse(geminiCalls[0].contents[0].parts[0].text).transactions[0];
-  assert.strictEqual(sent.transaction_id, "no-id-1");
-
-  const lastRow = sheet.data.length; // 1-based row of the target
-  const touched = [...new Set(sheet.writes.map((w) => w.row))];
-  assert.deepStrictEqual(touched, [lastRow]);
-  assert.strictEqual(sheet.data[lastRow - 1][HEADERS.indexOf("Category")], "Restaurants");
-  assert.ok(logs.includes("Found 1 of 1 transactions in first " + (lastRow - 1) + " rows."));
-});
-
-test("two identical rows with no Transaction ID are each written once", () => {
-  const row = () => [new Date(2023, 8, 25), "", "", -19.99, "Krispy Kreme", "", ""];
-  const { sheet, spreadsheet } = noIdSetup([row(), row()]);
-  const { context } = loadScripts(SOURCES, {
-    spreadsheet,
-    scriptProperties: { GCP_PROJECT_ID: "proj" },
-    fetch: (url) => {
-      if (url.includes("/gviz/")) {
-        return {
-          getContentText: () =>
-            gvizResponse([
-              [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"],
-              [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"],
-            ]),
-        };
-      }
-      return geminiResponse([
-        { transaction_id: "no-id-1", updated_description: "Krispy Kreme", category: "Restaurants" },
-        { transaction_id: "no-id-2", updated_description: "Krispy Kreme", category: "Restaurants" },
-      ]);
-    },
-  });
-  context.categorizeUncategorizedTransactions();
-  const n = sheet.data.length;
-  assert.deepStrictEqual(
-    [sheet.data[n - 2][2], sheet.data[n - 1][2]],
-    ["Restaurants", "Restaurants"]
-  );
-  assert.strictEqual(new Set(sheet.writes.map((w) => w.a1)).size, sheet.writes.length);
-});
-
 // --- Writing after each stage -----------------------------------------------
 
 test("Jev's matches are written before Gemini is called, then Gemini's in a second sweep", () => {
@@ -764,57 +682,109 @@ test("Jev's matches are written before Gemini is called, then Gemini's in a seco
   );
 });
 
-function noIdRun(sheetRows, gvizRow, extra) {
-  const { sheet, spreadsheet } = noIdSetup(sheetRows);
-  Object.assign(spreadsheet, (extra && extra.spreadsheet) || {});
+
+// --- Assigning Transaction IDs to rows that have none -----------------------
+
+test("ulid() is 26 Crockford base-32 characters that sort by time", () => {
+  const { context } = loadScripts(SOURCES);
+  const a = context.ulid(1469918176385);
+  const b = context.ulid(1469918176386);
+  assert.match(a, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+  // The timestamp example from the ULID spec (github.com/ulid/spec).
+  assert.strictEqual(a.slice(0, 10), "01ARYZ6S41");
+  assert.ok(a.slice(0, 10) < b.slice(0, 10));
+});
+
+/**
+ * A sheet whose gviz query is answered from the sheet's current contents, so
+ * ids written before the query are visible to it, as on a real sheet.
+ */
+function liveRun(sheetRows, geminiAnswer) {
+  const sheet = new FakeSheet("Transactions", HEADERS, sheetRows);
+  const spreadsheet = new FakeSpreadsheet({
+    Transactions: sheet,
+    Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
+  });
+  let flushed = false;
+  const col = (name) => HEADERS.indexOf(name);
   const loaded = loadScripts(SOURCES, {
     spreadsheet,
     scriptProperties: { GCP_PROJECT_ID: "proj" },
-    fetch: (url) => {
-      if (url.includes("/gviz/")) return { getContentText: () => gvizResponse([gvizRow]) };
-      return geminiResponse([
-        { transaction_id: "no-id-1", updated_description: "Krispy Kreme", category: "Restaurants" },
-      ]);
+    onFlush: () => (flushed = true),
+    fetch: (url, params) => {
+      if (url.includes("/gviz/")) {
+        const idWrites = sheet.writes.filter((w) => w.column === "Transaction ID");
+        assert.ok(flushed || idWrites.length === 0, "ids must be flushed before the gviz query");
+        const rows = sheet.data
+          .slice(1)
+          .filter((r) => r[col("Full Description")] !== "" && r[col("Category")] === "")
+          .slice(0, 50)
+          .map((r) => [
+            r[col("Transaction ID")] === "" ? null : r[col("Transaction ID")],
+            r[col("Full Description")],
+            r[col("Amount")],
+            "Date(2023,8,25)",
+          ]);
+        return { getContentText: () => gvizResponse(rows) };
+      }
+      const payload = JSON.parse(JSON.parse(params.payload).contents[0].parts[0].text);
+      return geminiResponse(payload.transactions.map(geminiAnswer));
     },
   });
-  if (extra && extra.formatDate) loaded.context.Utilities.formatDate = extra.formatDate;
   loaded.context.categorizeUncategorizedTransactions();
   return { sheet, logs: loaded.logs };
 }
 
-test("a row with no id still matches through stray spaces, blank-looking cells and extra decimals", () => {
-  const { sheet } = noIdRun(
-    [[new Date(2023, 8, 25), "", " ", -19.990000001, "  Krispy  Kreme ", "  ", ""]],
-    [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"]
-  );
-  assert.strictEqual(sheet.data[sheet.data.length - 1][2], "Restaurants");
+test("a row with no Transaction ID is given one, sent with it, and written back", () => {
+  const rows = HISTORY.map((r) => r.slice()).concat([
+    [new Date(2023, 8, 25), "", "", -19.99, "Krispy Kreme", "", ""],
+  ]);
+  const sent = [];
+  const { sheet, logs } = liveRun(rows, (t) => {
+    sent.push(t.transaction_id);
+    return { transaction_id: t.transaction_id, updated_description: "Krispy Kreme", category: "Restaurants" };
+  });
+  const last = sheet.data[sheet.data.length - 1];
+  assert.match(last[HEADERS.indexOf("Transaction ID")], /^autocat:[0-9A-HJKMNP-TV-Z]{26}$/);
+  assert.deepStrictEqual(sent, [last[HEADERS.indexOf("Transaction ID")]]);
+  assert.strictEqual(last[HEADERS.indexOf("Category")], "Restaurants");
+  assert.ok(logs.includes("Assigned a Transaction ID to 1 row(s) that had none: rows " + sheet.data.length));
 });
 
-test("dates from the sheet are read in the spreadsheet's time zone", () => {
-  // The script's zone puts the cell on the 24th; the spreadsheet's on the 25th.
-  const { sheet } = noIdRun(
-    [[new Date(2023, 8, 24, 21), "", "", -19.99, "Krispy Kreme", "", ""]],
-    [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"],
-    {
-      spreadsheet: { getSpreadsheetTimeZone: () => "America/New_York" },
-      formatDate: (d, zone, fmt) => {
-        assert.strictEqual(zone, "America/New_York");
-        assert.strictEqual(fmt, "yyyy-MM-dd");
-        return "2023-09-25";
-      },
-    }
-  );
-  assert.strictEqual(sheet.data[sheet.data.length - 1][2], "Restaurants");
+test("only rows about to be sent get an id; categorized rows and rows with ids are left alone", () => {
+  const rows = HISTORY.map((r) => r.slice()).concat([
+    [new Date(2023, 8, 25), "Done", "Restaurants", -1, "CATEGORIZED NO ID", "", ""], // has a category
+    [new Date(2023, 8, 25), "", "", -1, "", "", ""], // no Full Description
+    [new Date(2023, 8, 25), "", "", -1, "HAS AN ID", "EXISTING", ""],
+    [new Date(2023, 8, 25), "", "", -1, "NEEDS AN ID", "", ""],
+  ]);
+  const { sheet } = liveRun(rows, (t) => ({
+    transaction_id: t.transaction_id,
+    updated_description: "x",
+    category: "Restaurants",
+  }));
+  const idWrites = sheet.writes.filter((w) => w.column === "Transaction ID");
+  assert.strictEqual(idWrites.length, 1);
+  assert.strictEqual(idWrites[0].row, sheet.data.length);
+  const n = sheet.data.length;
+  assert.strictEqual(sheet.data[n - 4][HEADERS.indexOf("Transaction ID")], "");
+  assert.strictEqual(sheet.data[n - 3][HEADERS.indexOf("Transaction ID")], "");
+  assert.strictEqual(sheet.data[n - 2][HEADERS.indexOf("Transaction ID")], "EXISTING");
 });
 
-test("when a row with no id cannot be found, the near misses are logged", () => {
-  const { sheet, logs } = noIdRun(
-    [[new Date(2023, 8, 25), "", "", -20.5, "Krispy Kreme", "", ""]],
-    [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"]
-  );
-  assert.strictEqual(sheet.writes.length, 0);
-  const at = logs.findIndex((l) => typeof l === "string" && l.startsWith("Could not find the row"));
-  assert.ok(at !== -1, "expected a could-not-find line");
-  assert.match(logs[at], /no-id-1 \("Krispy Kreme", 2023-09-25, -19\.99\)/);
-  assert.match(logs[at + 1], /^row \d+: id="" \(string\), category="" \(string\), date=".*" \(date\), amount=-20\.5 \(number\)$/);
+test("ids are assigned only within the batch the query will return", () => {
+  // 50 uncategorized rows that already have ids come first, so the id-less row
+  // after them is not in this run's batch and must not be given an id yet.
+  const rows = HISTORY.map((r) => r.slice());
+  for (let i = 0; i < 50; i++) {
+    rows.push([new Date(2023, 8, 25), "", "", -1, "ROW " + i, "ID" + i, ""]);
+  }
+  rows.push([new Date(2023, 8, 25), "", "", -1, "LATER NO ID", "", ""]);
+  const { sheet } = liveRun(rows, (t) => ({
+    transaction_id: t.transaction_id,
+    updated_description: "x",
+    category: "to-be-categorized",
+  }));
+  assert.strictEqual(sheet.writes.filter((w) => w.column === "Transaction ID").length, 0);
+  assert.strictEqual(sheet.data[sheet.data.length - 1][HEADERS.indexOf("Transaction ID")], "");
 });

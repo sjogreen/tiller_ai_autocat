@@ -334,6 +334,9 @@ function loadScripts(sources, opts) {
     },
     SpreadsheetApp: {
       getActiveSpreadsheet: () => options.spreadsheet || null,
+      flush: () => {
+        if (options.onFlush) options.onFlush();
+      },
       getUi: () => ({
         createMenu: () => ({ addItem: () => ({ addToUi: () => {} }) }),
       }),

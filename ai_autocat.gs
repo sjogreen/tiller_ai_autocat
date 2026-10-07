@@ -102,6 +102,7 @@ const MAX_BATCH_SIZE = 50;
 var TRANSACTION_SEARCHER = null;
 
 function categorizeUncategorizedTransactions() {
+  assignMissingTransactionIds();
   var uncategorizedTransactions = getTransactionsToCategorize();
 
   var numTxnsToCategorize = uncategorizedTransactions.length;
@@ -122,7 +123,6 @@ function categorizeUncategorizedTransactions() {
     };
     if (txn.amount !== undefined) entry.amount = txn.amount;
     if (txn.date) entry.date = txn.date;
-    if (txn.no_transaction_id) entry.no_transaction_id = true;
     entry.previous_transactions = findSimilarTransactions(
       txn.original_description,
       txn.amount
@@ -171,17 +171,11 @@ function categorizeUncategorizedTransactions() {
     }
   }
 
-  // Rows with no Transaction ID are found by their contents when writing.
-  var noIdRows = {};
-  transactionList.forEach(function (t) {
-    if (t.no_transaction_id) noIdRows[t.transaction_id] = t;
-  });
-
   // Write Jev's answers now, so they are saved even if the Gemini call fails
   // or the run is cut off.
   if (byPrecedent.suggestions.length > 0) {
     Logger.log("Writing Jev's matches into your sheet...");
-    writeUpdatedTransactions(byPrecedent.suggestions, categoryList, noIdRows);
+    writeUpdatedTransactions(byPrecedent.suggestions, categoryList);
   }
 
   // Stage 2: Gemini answers for everything Jev did not settle.
@@ -217,7 +211,7 @@ function categorizeUncategorizedTransactions() {
 
   if (byGemini.length > 0) {
     Logger.log("Writing Gemini's answers into your sheet...");
-    writeUpdatedTransactions(byGemini, categoryList, noIdRows);
+    writeUpdatedTransactions(byGemini, categoryList);
   }
 
   if (byPrecedent.suggestions.length > 0 || byGemini.length > 0) {
@@ -249,58 +243,93 @@ function isoDate(value) {
   return String(value);
 }
 
-// Stand-in transaction ids for rows that have none; see getTransactionsToCategorize.
-const NO_ID_PREFIX = "no-id-";
+// Transaction IDs this script assigns, to rows it is about to send that have
+// none (usually rows added by hand). Tiller's own hand-entered rows use
+// "manual:<uuid>"; this prefix marks where these came from and cannot collide.
+const ASSIGNED_ID_PREFIX = "autocat:";
 
-// Helpers for finding a row with no Transaction ID by its contents. What the
-// gviz query returned and what the sheet holds can differ in small ways - extra
-// spaces, a blank-looking cell that is not empty, an amount stored with more
-// decimal places than it shows, or a date read in a different time zone - so
-// text, blanks and amounts are compared loosely and dates by the sheet's day.
-function isBlankCell(value) {
-  return value === null || value === undefined || String(value).trim() === "";
-}
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-function sameText(a, b) {
-  var norm = function (v) {
-    return String(v === null || v === undefined ? "" : v).replace(/\s+/g, " ").trim();
-  };
-  return norm(a) === norm(b);
-}
-
-function sameAmount(a, b) {
-  var cents = function (v) {
-    var n = typeof v === "number" ? v : Number(String(v).replace(/[$,\s]/g, ""));
-    return isNaN(n) ? null : Math.round(n * 100);
-  };
-  return cents(a) !== null && cents(a) === cents(b);
-}
-
-// The day a sheet date falls on, as YYYY-MM-DD in the spreadsheet's own time
-// zone. That is the day gviz reports; a Date read from the sheet is formatted
-// in the script's time zone by isoDate, which can be a day off when the two
-// differ.
-function sheetDay(value) {
-  if (
-    Object.prototype.toString.call(value) === "[object Date]" &&
-    typeof Utilities.formatDate === "function"
-  ) {
-    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-    var zone = spreadsheet.getSpreadsheetTimeZone && spreadsheet.getSpreadsheetTimeZone();
-    if (zone) return Utilities.formatDate(value, zone, "yyyy-MM-dd");
+// A ULID: 10 characters of millisecond timestamp, then 16 of randomness, in
+// Crockford base 32. Sorts by creation time.
+function ulid(now) {
+  var time = now === undefined ? Date.now() : now;
+  var out = "";
+  for (var i = 0; i < 10; i++) {
+    out = CROCKFORD.charAt(time % 32) + out;
+    time = Math.floor(time / 32);
   }
-  return isoDate(value);
+  for (var j = 0; j < 16; j++) {
+    out += CROCKFORD.charAt(Math.floor(Math.random() * 32));
+  }
+  return out;
 }
 
-function sameDay(sheetValue, isoWanted) {
-  return sheetDay(sheetValue) === isoWanted;
-}
+/**
+ * Gives a Transaction ID to every row this run is about to send that has none,
+ * so that its answer can be written back by id like any other row.
+ *
+ * "About to send" follows the same rule as getTransactionsToCategorize: rows
+ * with a Full Description and no Category, in sheet order, up to
+ * MAX_BATCH_SIZE of them. Only the empty Transaction ID cells of those rows are
+ * written (invariant (b)), and the writes are flushed so the gviz query that
+ * follows sees them.
+ *
+ * @returns {number} how many ids were assigned
+ */
+function assignMissingTransactionIds() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
+    TRANSACTION_SHEET_NAME
+  );
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var idColIdx = headers.indexOf(TRANSACTION_ID_COL_NAME);
+  var fullDescColIdx = headers.indexOf(ORIGINAL_DESCRIPTION_COL_NAME);
+  var catColIdx = headers.indexOf(CATEGORY_COL_NAME);
+  if (idColIdx === -1 || fullDescColIdx === -1 || catColIdx === -1) return 0;
 
-// Describes a cell's value and type for the log, so a mismatch can be diagnosed.
-function describeCell(value) {
-  if (value === null || value === undefined) return String(value);
-  var type = Object.prototype.toString.call(value) === "[object Date]" ? "date" : typeof value;
-  return JSON.stringify(type === "date" ? value.toISOString() : value) + " (" + type + ")";
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  var blank = function (v) {
+    return v === null || v === undefined || v === "";
+  };
+  var BATCH = 2000;
+  var cells = [];
+  var seen = 0;
+
+  for (var start = 2; start <= lastRow && seen < MAX_BATCH_SIZE; start += BATCH) {
+    var size = Math.min(BATCH, lastRow - start + 1);
+    var ids = sheet.getRange(start, idColIdx + 1, size, 1).getValues();
+    var descs = sheet.getRange(start, fullDescColIdx + 1, size, 1).getValues();
+    var cats = sheet.getRange(start, catColIdx + 1, size, 1).getValues();
+
+    for (var r = 0; r < size && seen < MAX_BATCH_SIZE; r++) {
+      if (blank(descs[r][0]) || !blank(cats[r][0])) continue;
+      seen++;
+      if (blank(ids[r][0])) {
+        cells.push({
+          row: start + r,
+          column: idColIdx + 1,
+          value: ASSIGNED_ID_PREFIX + ulid(),
+        });
+      }
+    }
+  }
+
+  if (cells.length === 0) return 0;
+
+  planCellWrites(cells).forEach(function (block) {
+    sheet
+      .getRange(block.row, block.column, block.values.length, block.values[0].length)
+      .setValues(block.values);
+  });
+  SpreadsheetApp.flush();
+
+  Logger.log(
+    "Assigned a Transaction ID to " + cells.length + " row(s) that had none: rows " +
+      cells.map(function (c) { return c.row; }).join(", ")
+  );
+  return cells.length;
 }
 
 // Gets up to MAX_BATCH_SIZE transactions that have an original description but
@@ -353,14 +382,8 @@ function getTransactionsToCategorize() {
     "A:" + lastColLetter
   );
 
-  return uncategorizedTransactions.map(function (row, i) {
+  return uncategorizedTransactions.map(function (row) {
     var txn = { transaction_id: row[0], original_description: row[1] };
-    // Rows added by hand can have no Transaction ID. They get a stand-in id for
-    // this run, and writeUpdatedTransactions finds them by their contents.
-    if (row[0] === null || row[0] === undefined || row[0] === "") {
-      txn.transaction_id = NO_ID_PREFIX + (i + 1);
-      txn.no_transaction_id = true;
-    }
     if (amountAt !== -1 && typeof row[amountAt] === "number") {
       txn.amount = row[amountAt];
     }
@@ -591,15 +614,7 @@ function planCellWrites(cells) {
 // Reads the transaction ID column in batches until every target transaction has
 // been located - new transactions sit at the top of a Tiller sheet, so this
 // usually touches only the first batch - then writes just the cells that change.
-//
-// noIdRows (optional) maps the stand-in ids of rows that have no Transaction ID
-// to what was read from them: {original_description, amount?, date}. Such a row
-// is found as the first row with a blank Transaction ID and a blank Category
-// whose Full Description, Date and Amount match (Date and Amount only when they
-// were read). Rows that are identical in all of those get identical answers, so
-// which of them is matched first does not matter.
-function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
-  noIdRows = noIdRows || {};
+function writeUpdatedTransactions(transactionList, categoryList) {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
     TRANSACTION_SHEET_NAME
   );
@@ -627,31 +642,14 @@ function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
 
   // Build set of transaction IDs we need to find
   var targetIds = {};
-  var pendingNoId = [];
   for (var i = 0; i < transactionList.length; i++) {
-    var targetId = transactionList[i]["transaction_id"];
-    targetIds[targetId] = transactionList[i];
-    if (Object.prototype.hasOwnProperty.call(noIdRows, targetId)) {
-      pendingNoId.push(targetId);
-    }
+    targetIds[transactionList[i]["transaction_id"]] = transactionList[i];
   }
   var numTargets = transactionList.length;
-
-  // Columns needed only to find rows without a Transaction ID.
-  var fullDescColIdx = headers.indexOf(ORIGINAL_DESCRIPTION_COL_NAME);
-  var dateColIdx = headers.indexOf(DATE_COL_NAME);
-  var amountColIdx = headers.indexOf(AMOUNT_COL_NAME);
-  if (pendingNoId.length > 0 && fullDescColIdx === -1) {
-    pendingNoId = [];
-  }
-  var readColumn = function (colIdx, start, size) {
-    return colIdx === -1 ? null : sheet.getRange(start, colIdx + 1, size, 1).getValues();
-  };
 
   // --- STEP 2: Progressive ID Loading ---
   // Read IDs in batches until we find all target transactions
   var foundRows = {}; // txId -> sheet row number (1-indexed)
-  var noIdLookalikes = []; // for the log, when a row with no id is not found
   var numFound = 0;
   var rowOffset = 2; // Start after header (row 1)
 
@@ -661,53 +659,8 @@ function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
       .getRange(rowOffset, idColIdx + 1, batchSize, 1)
       .getValues();
 
-    var noIdColumns = null;
-    if (pendingNoId.length > 0) {
-      noIdColumns = {
-        fullDesc: readColumn(fullDescColIdx, rowOffset, batchSize),
-        category: readColumn(catColIdx, rowOffset, batchSize),
-        date: readColumn(dateColIdx, rowOffset, batchSize),
-        amount: readColumn(amountColIdx, rowOffset, batchSize),
-      };
-    }
-
     for (var b = 0; b < idBatch.length; b++) {
       var id = idBatch[b][0];
-
-      if (noIdColumns) {
-        for (var p = 0; p < pendingNoId.length; p++) {
-          var want = noIdRows[pendingNoId[p]];
-          if (!sameText(noIdColumns.fullDesc[b][0], want.original_description)) {
-            continue;
-          }
-          var matches =
-            isBlankCell(id) &&
-            isBlankCell(noIdColumns.category[b][0]) &&
-            (!want.date || !noIdColumns.date ||
-              sameDay(noIdColumns.date[b][0], want.date)) &&
-            (want.amount === undefined || !noIdColumns.amount ||
-              sameAmount(noIdColumns.amount[b][0], want.amount));
-          if (matches) {
-            foundRows[pendingNoId[p]] = rowOffset + b;
-            pendingNoId.splice(p, 1);
-            numFound++;
-            break;
-          }
-          // Same Full Description but not a match: keep a few for the log.
-          if (noIdLookalikes.length < 10) {
-            noIdLookalikes.push(
-              "row " + (rowOffset + b) +
-                ": id=" + describeCell(id) +
-                ", category=" + describeCell(noIdColumns.category[b][0]) +
-                ", date=" + describeCell(noIdColumns.date && noIdColumns.date[b][0]) +
-                ", amount=" + describeCell(noIdColumns.amount && noIdColumns.amount[b][0])
-            );
-          }
-        }
-        if (numFound >= numTargets) break;
-        if (isBlankCell(id)) continue;
-      }
-
       // hasOwnProperty via Object.prototype, so that an id colliding with an
       // inherited member name cannot produce a false match.
       if (
@@ -723,16 +676,6 @@ function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
 
     rowOffset += batchSize;
   }
-
-  pendingNoId.forEach(function (stand) {
-    var want = noIdRows[stand];
-    Logger.log(
-      "Could not find the row with no Transaction ID for " + stand + " (" +
-        JSON.stringify(want.original_description) + ", " + want.date + ", " +
-        want.amount + "). Rows with that Full Description that did not match:"
-    );
-    Logger.log(noIdLookalikes.length ? noIdLookalikes.join("\n") : "(none)");
-  });
 
   if (numFound === 0) {
     Logger.log("No matching transactions found to update.");
