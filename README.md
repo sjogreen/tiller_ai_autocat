@@ -25,7 +25,8 @@ get an ID, and only their Transaction ID cell is written.
 
 1. **Find previous transactions.** For each one, a TF-IDF word-overlap search
    over the Full Description of your categorized transactions from the last
-   365 days finds up to 6 similar ones.  When more than 6 of the top 20 matches
+   365 days (the most recent 5,000, read with one query) finds up to 6 similar
+   ones.  When more than 6 of the top 20 matches
    tie exactly on word overlap (every "CHECK #1234" looks alike), the ones
    closest in amount are chosen instead, the closest of each category first.
    This runs inside the sheet and sends nothing anywhere.

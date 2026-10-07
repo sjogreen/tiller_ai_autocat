@@ -1060,3 +1060,70 @@ test("the sheet is scanned for missing ids only when the query returns a row wit
   assert.match(last[col("Transaction ID")], /^autocat:/);
   assert.strictEqual(last[col("Category")], "Restaurants");
 });
+
+// --- Building the index from one query --------------------------------------
+
+test("the index comes from one query: categorized, last 365 days, newest first, at most 5000", () => {
+  const queries = [];
+  const sheet = new FakeSheet("Transactions", HEADERS, HISTORY.map((r) => r.slice()));
+  const { context } = loadScripts(SOURCES, {
+    spreadsheet: new FakeSpreadsheet({ Transactions: sheet }),
+    onIndexQuery: (q) => queries.push(q),
+  });
+  const since = new Date(2025, 9, 8);
+  const searcher = context.createSearchIndexWithStandardColumns({ minTermSize: 3, since });
+  // Date A, Description B, Category C, Amount D, Full Description E, ID F.
+  assert.deepStrictEqual(queries, [
+    "SELECT F, E, B, A, C, D WHERE C is not null AND A >= date '2025-10-08' ORDER BY A desc LIMIT 5000",
+  ]);
+  const docs = plain(searcher.documents);
+  assert.deepStrictEqual(docs.map((d) => d.id).sort(), ["H1", "H2", "H3"]);
+  const safeway = docs.find((d) => d.id === "H1");
+  assert.deepStrictEqual(
+    [safeway.text, safeway.updatedText, safeway.category, safeway.amount],
+    ["SAFEWAY #1234 SAN FRANCISCO CA", "Safeway", "Groceries", -42.1]
+  );
+  assert.strictEqual(context.isoDate(searcher.documents.find((d) => d.id === "H1").date), iso(HISTORY[0][0]));
+});
+
+test("without a Date column the index query has no window or ordering", () => {
+  const headers = ["Description", "Category", "Full Description", "Transaction ID"];
+  const queries = [];
+  const sheet = new FakeSheet("Transactions", headers, [["Safeway", "Groceries", "SAFEWAY", "H1"]]);
+  const { context } = loadScripts(SOURCES, {
+    spreadsheet: new FakeSpreadsheet({ Transactions: sheet }),
+    onIndexQuery: (q) => queries.push(q),
+  });
+  context.createSearchIndexWithStandardColumns({ minTermSize: 3 });
+  assert.deepStrictEqual(queries, ["SELECT D, C, A, B WHERE B is not null LIMIT 5000"]);
+});
+
+test("the index query and the index build are timed separately", () => {
+  let clock = 0;
+  const sheet = new FakeSheet("Transactions", HEADERS, manyRows(3));
+  const col = (name) => HEADERS.indexOf(name);
+  const { context, logs } = loadScripts(SOURCES, {
+    spreadsheet: new FakeSpreadsheet({
+      Transactions: sheet,
+      Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
+    }),
+    scriptProperties: { GCP_PROJECT_ID: "proj" },
+    onIndexQuery: () => (clock += 2500),
+    fetch: (url, params) => {
+      if (url.includes("/gviz/")) {
+        const batch = sheet.data
+          .slice(1)
+          .filter((r) => r[col("Category")] === "")
+          .map((r) => [r[col("Transaction ID")], r[col("Full Description")], -1, "Date(2023,8,25)"]);
+        return { getContentText: () => gvizResponse(batch) };
+      }
+      const payload = JSON.parse(JSON.parse(params.payload).contents[0].parts[0].text);
+      return geminiResponse(payload.transactions.map(answerAll));
+    },
+  });
+  context.categorizeUncategorizedTransactions({ budgetMs: 300000, now: () => clock });
+  const line = logs.find((l) => typeof l === "string" && l.startsWith("Batch 1 timing"));
+  assert.strictEqual(line, "Batch 1 timing (3 rows): 2.5s total: query previous transactions 2.5s");
+  const labels = require("vm").runInContext("TIMING_PHASES", context).map((p) => p[1]);
+  assert.ok(labels.includes("query previous transactions") && labels.includes("build search index"));
+});

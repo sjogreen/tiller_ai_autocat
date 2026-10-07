@@ -102,7 +102,7 @@ function indexSetup(tfidfSource, autocatSource) {
     ]
   );
   const spreadsheet = new FakeSpreadsheet({ Transactions: transactions });
-  return loadScripts([tfidfSource, autocatSource], { spreadsheet });
+  return loadScripts([readWorkingTree("gviz.gs"), tfidfSource, autocatSource], { spreadsheet });
 }
 
 test("createSearchIndex honours the options it is handed", () => {

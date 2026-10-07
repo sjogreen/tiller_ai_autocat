@@ -66,8 +66,10 @@ const JEV_NONE_OPTION =
 const JEV_INSTRUCTIONS =
   "Which previous transaction is the same merchant or the same recurring payment as the transaction in the state? Compare the state's bank_description with each option's bank_description: both are raw text from the bank, so the same merchant or payee recurs with the same words, minus store numbers, dates and reference codes. An option's category is how the household filed that earlier transaction; it is what the caller will copy from the option you choose, not what to match on. Prefer the option closest in amount and in day of the month when several are the same merchant. Choose none when no option is the same merchant or the same recurring payment.";
 
-// Only transactions from this many days back are used as previous transactions.
+// Only transactions from this many days back are used as previous transactions,
+// and at most PRECEDENT_CAP of them (the most recent).
 const PRECEDENT_LOOKBACK_DAYS = 365;
+const PRECEDENT_CAP = 5000;
 
 // Previous transactions shown per transaction, to Jev as options and to Gemini.
 // They are chosen from the top PRECEDENT_CANDIDATES search hits: when more of
@@ -123,7 +125,8 @@ const TIMING_PHASES = [
   ["categories", "category list"],
   ["query", "find uncategorized"],
   ["assignIds", "assign missing ids"],
-  ["searchIndex", "build search index"],
+  ["indexQuery", "query previous transactions"],
+  ["indexBuild", "build search index"],
   ["similarSearch", "find previous transactions"],
   ["jevRequests", "Jev requests"],
   ["jevWrites", "write Jev matches"],
@@ -594,50 +597,95 @@ function getTransactionsToCategorize() {
   });
 }
 
+/**
+ * Builds the search index of previous transactions with one gviz query, so the
+ * sheet does the filtering: categorized rows dated within the last
+ * PRECEDENT_LOOKBACK_DAYS days, newest first, at most PRECEDENT_CAP of them.
+ * Only those rows are read into the script, however long the sheet is.
+ *
+ * Options are the TFIDFSearch tuning options (useStopWords, matchThreshold,
+ * minTermSize), plus `since` (a Date) to move the start of the window.
+ */
 function createSearchIndexWithStandardColumns(options) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
-    TRANSACTION_SHEET_NAME
-  );
+  options = options || {};
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = spreadsheet.getSheetByName(TRANSACTION_SHEET_NAME);
   var headers = sheet.getRange("1:1").getValues()[0];
+  var letter = function (name) {
+    return getColumnLetterFromColumnHeader(headers, name);
+  };
 
-  var idColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    TRANSACTION_ID_COL_NAME
-  );
-  var descColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    DESCRIPTION_COL_NAME
-  );
-  var origDescColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    ORIGINAL_DESCRIPTION_COL_NAME
-  );
-  var categoryColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    CATEGORY_COL_NAME
-  );
-  var dateColLetter = getColumnLetterFromColumnHeader(headers, DATE_COL_NAME);
-  var amountColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    AMOUNT_COL_NAME
-  );
+  // Invariant (a): optional columns resolve to "" and are left out.
+  var columns = [
+    ["id", letter(TRANSACTION_ID_COL_NAME)],
+    ["text", letter(ORIGINAL_DESCRIPTION_COL_NAME)],
+    ["updatedText", letter(DESCRIPTION_COL_NAME)],
+    ["date", letter(DATE_COL_NAME)],
+    ["category", letter(CATEGORY_COL_NAME)],
+    ["amount", letter(AMOUNT_COL_NAME)],
+  ].filter(function (c) {
+    return c[1] !== "";
+  });
+  var at = {};
+  columns.forEach(function (c, i) {
+    at[c[0]] = i;
+  });
+  var dateLetter = letter(DATE_COL_NAME);
+  var since = Object.prototype.toString.call(options.since) === "[object Date]"
+    ? options.since
+    : lookbackStart(PRECEDENT_LOOKBACK_DAYS);
 
-  var searcher = createSearchIndex(
-    TRANSACTION_SHEET_NAME,
-    idColLetter, // ID Column
-    origDescColLetter, // text column
-    descColLetter, // updated text column
-    dateColLetter, // date column (for breaking ranking ties)
-    categoryColLetter, // category column
-    amountColLetter, // amount (used to disambiguate buys vs sells with the same description)
-    2,
-    Object.assign(
-      { since: lookbackStart(PRECEDENT_LOOKBACK_DAYS) },
-      options || {}
-    )
-  );
+  var where = [letter(CATEGORY_COL_NAME) + " is not null"];
+  if (dateLetter) where.push(dateLetter + " >= date '" + isoDate(since) + "'");
+  var query =
+    "SELECT " +
+    columns.map(function (c) { return c[1]; }).join(", ") +
+    " WHERE " + where.join(" AND ") +
+    (dateLetter ? " ORDER BY " + dateLetter + " desc" : "") +
+    " LIMIT " + PRECEDENT_CAP;
 
-  return searcher;
+  var rows = timed("indexQuery", function () {
+    return Utils.gvizQuery(
+      spreadsheet.getId(),
+      query,
+      TRANSACTION_SHEET_NAME,
+      "A:" + getColumnLetterFromColumnHeader(headers, headers[headers.length - 1])
+    );
+  });
+
+  return timed("indexBuild", function () {
+    return indexDocuments(rows, at, options);
+  });
+}
+
+// Turns the index query's rows into a TFIDFSearch: drops rows without a
+// category, converts gviz dates, and tokenizes every description.
+function indexDocuments(rows, at, options) {
+  var value = function (row, name) {
+    return at[name] === undefined ? undefined : row[at[name]];
+  };
+  var documents = [];
+  rows.forEach(function (row) {
+    var category = value(row, "category");
+    if (!category) return;
+    // gviz gives dates as "Date(2026,7,14)"; the search breaks ties on a Date.
+    var day = isoDate(value(row, "date"));
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+    documents.push({
+      id: value(row, "id"),
+      text: value(row, "text") || "",
+      updatedText: value(row, "updatedText") || "",
+      date: m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null,
+      category: category,
+      amount: value(row, "amount"),
+    });
+  });
+
+  return new TFIDFSearch(documents, {
+    useStopWords: options.useStopWords !== undefined ? options.useStopWords : true,
+    matchThreshold: options.matchThreshold !== undefined ? options.matchThreshold : 0.25,
+    minTermSize: options.minTermSize !== undefined ? options.minTermSize : 3,
+  });
 }
 
 /**
@@ -693,10 +741,8 @@ function closestByAmount(hits, amount, slots) {
 
 function findSimilarTransactions(originalDescription, amount) {
   if (TRANSACTION_SEARCHER === null) {
-    TRANSACTION_SEARCHER = timed("searchIndex", function () {
-      return createSearchIndexWithStandardColumns({
-        minTermSize: 3,
-      });
+    TRANSACTION_SEARCHER = createSearchIndexWithStandardColumns({
+      minTermSize: 3,
     });
   }
 

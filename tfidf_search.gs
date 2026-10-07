@@ -266,7 +266,10 @@ function createSearchIndex(
   const documents = [];
   // Optional lookback: rows dated before this are left out of the index. Rows
   // with no date are kept, since there is nothing to judge them by.
-  const since = options.since instanceof Date ? options.since : null;
+  const since =
+    Object.prototype.toString.call(options.since) === "[object Date]"
+      ? options.since
+      : null;
 
   // Process each row, skipping those without required category
   for (let i = 0; i < ids.length; i++) {
