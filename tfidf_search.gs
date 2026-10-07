@@ -132,13 +132,16 @@ TFIDFSearch.prototype.search = function (query, limit) {
   limit = limit || 5;
 
   var queryWords = this.tokenize(query);
-  var scores = new Array(this.docCount).fill(0);
 
+  // Only documents that contain a query term can score above zero, so walk
+  // each term's posting list rather than every document. Scores and the
+  // distinct-term counts are kept sparsely, keyed by document index.
+  var scores = Object.create(null);
   // How many DISTINCT query terms matched each document. A term repeated in the
   // query contributes to the score on each occurrence but lifts this count only
-  // once; the previous implementation got that behaviour implicitly by keying a
-  // per-document map on the term.
-  var matchedTermCounts = new Array(this.docCount).fill(0);
+  // once.
+  var matchedTermCounts = Object.create(null);
+  var touched = [];
   var countedWords = Object.create(null);
 
   for (var i = 0; i < queryWords.length; i++) {
@@ -147,8 +150,15 @@ TFIDFSearch.prototype.search = function (query, limit) {
     var isFirstOccurrence = countedWords[word] === undefined;
     countedWords[word] = true;
 
-    for (var j = 0; j < this.docCount; j++) {
+    var posting = this.wordDocs[word] || [];
+    for (var p = 0; p < posting.length; p++) {
+      var j = posting[p];
       var wordScore = this.tf(word, j) * idfScore;
+      if (scores[j] === undefined) {
+        scores[j] = 0;
+        matchedTermCounts[j] = 0;
+        touched.push(j);
+      }
       scores[j] += wordScore;
 
       if (isFirstOccurrence && wordScore > 0) {
@@ -157,8 +167,14 @@ TFIDFSearch.prototype.search = function (query, limit) {
     }
   }
 
+  // Document order, so equal-scoring results keep the order a full scan gave.
+  touched.sort(function (a, b) {
+    return a - b;
+  });
+
   var results = [];
-  for (var k = 0; k < this.docCount; k++) {
+  for (var t = 0; t < touched.length; t++) {
+    var k = touched[t];
     // Favour documents that matched more of the query's distinct terms.
     var score = scores[k] * Math.pow(1.2, matchedTermCounts[k] - 1);
 
@@ -248,11 +264,21 @@ function createSearchIndex(
   const amounts = amountRange.getValues().flat();
 
   const documents = [];
+  // Optional lookback: rows dated before this are left out of the index. Rows
+  // with no date are kept, since there is nothing to judge them by.
+  const since =
+    Object.prototype.toString.call(options.since) === "[object Date]"
+      ? options.since
+      : null;
 
   // Process each row, skipping those without required category
   for (let i = 0; i < ids.length; i++) {
     // Skip if category is empty or undefined
     if (!categories[i]) {
+      continue;
+    }
+
+    if (since && dates[i] && new Date(dates[i]) < since) {
       continue;
     }
 
@@ -275,6 +301,17 @@ function createSearchIndex(
       options.matchThreshold !== undefined ? options.matchThreshold : 0.25,
     minTermSize: options.minTermSize !== undefined ? options.minTermSize : 3,
   });
+}
+
+/**
+ * The start of the lookback window for previous transactions: midnight,
+ * `days` days before `now`.
+ */
+function lookbackStart(days, now) {
+  var start = new Date(now || new Date());
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - days);
+  return start;
 }
 
 /**

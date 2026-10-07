@@ -35,6 +35,57 @@ const GEMINI_MODEL = 'gemini-3.8-flash'; // Can be any model Vertex AI publishes
 const INPUT_COST_PER_M_TOKENS = 0.75;
 const OUTPUT_COST_PER_M_TOKENS = 3.75;
 
+// Generation settings: deterministic output, as little thinking as the model
+// allows, and a ceiling high enough that a full batch is never cut off
+// mid-answer. Vertex rejects MINIMAL for gemini-3.8-flash (HTTP 400, "Thinking
+// level is unsupported"), so LOW is the least it accepts.
+const GEMINI_TEMPERATURE = 0;
+const GEMINI_THINKING_LEVEL = 'LOW';
+const GEMINI_MAX_OUTPUT_TOKENS = 32000;
+
+// Optional Jev stage. When an OpenRouter API key is set as the script property
+// below, each transaction that has previous transactions is first shown to
+// TypeSafe's Jev, which picks the one that is the same merchant or recurring
+// payment (or none). A pick copies that transaction's category and description,
+// and only the rest go to Gemini. Without the property, Gemini does everything.
+// The key is read from Script Properties for the same reason as GCP_PROJECT_ID.
+const OPENROUTER_API_KEY_PROPERTY = 'OPENROUTER_API_KEY';
+const JEV_MODEL = 'typesafe/jev-1.13';
+const JEV_URL = 'https://openrouter.ai/api/alpha/decisions';
+// A pick is taken when the probability that no option matches is at most 0.5.
+// Gate on that rather than on the pick's own confidence: three previous
+// transactions from one merchant split the probability between them.
+const JEV_TAKE_THRESHOLD = 0.5;
+// Jev requests in flight at once, and so how many Jev answers each sheet write
+// carries. UrlFetchApp.fetchAll returns only when its slowest request does, so
+// smaller groups get answers into the sheet sooner and more steadily; 16 trades
+// a little total time for that. One transaction per request, since batching
+// several into one request made Jev take noticeably fewer matches.
+const JEV_CONCURRENCY = 16;
+const JEV_NONE = 'none';
+const JEV_NONE_OPTION =
+  'No previous transaction is the same merchant or the same recurring payment as this one';
+const JEV_INSTRUCTIONS =
+  "Which previous transaction is the same merchant or the same recurring payment as the transaction in the state? Compare the state's bank_description with each option's bank_description: both are raw text from the bank, so the same merchant or payee recurs with the same words, minus store numbers, dates and reference codes. An option's category is how the household filed that earlier transaction; it is what the caller will copy from the option you choose, not what to match on. Prefer the option closest in amount and in day of the month when several are the same merchant. Choose none when no option is the same merchant or the same recurring payment.";
+
+// Only transactions from this many days back are used as previous transactions,
+// and at most PRECEDENT_CAP of them (the most recent).
+const PRECEDENT_LOOKBACK_DAYS = 365;
+const PRECEDENT_CAP = 5000;
+
+// Previous transactions shown per transaction, to Jev as options and to Gemini.
+// They are chosen from the top PRECEDENT_CANDIDATES search hits: when more of
+// those than EXAMPLES_PER_ROW tie EXACTLY on score (within EXACT_TIE of the
+// top), the closest in amount win - see closestByAmount.
+const EXAMPLES_PER_ROW = 6;
+const PRECEDENT_CANDIDATES = 20;
+const EXACT_TIE = 0.9999;
+const OPPOSITE_SIGN_DISTANCE = 1000;
+
+// What Gemini answers when it declines to pick a category. It is never on the
+// allowed list, so writeUpdatedTransactions files it under FALLBACK_CATEGORY.
+const DECLINED_CATEGORY = "to-be-categorized";
+
 // Sheet Names
 const TRANSACTION_SHEET_NAME = "Transactions";
 const CATEGORY_SHEET_NAME = "Categories";
@@ -44,6 +95,7 @@ const TRANSACTION_ID_COL_NAME = "Transaction ID";
 const ORIGINAL_DESCRIPTION_COL_NAME = "Full Description";
 const DESCRIPTION_COL_NAME = "Description";
 const CATEGORY_COL_NAME = "Category";
+const GROUP_COL_NAME = "Group";
 const AI_AUTOCAT_COL_NAME = "AI AutoCat";
 const DATE_COL_NAME = "Date";
 const AMOUNT_COL_NAME = "Amount";
@@ -52,60 +104,451 @@ const AMOUNT_COL_NAME = "Amount";
 const FALLBACK_CATEGORY = "To Be Categorized";
 
 // Other Misc Paramaters
-const MAX_BATCH_SIZE = 50;
+// Rows per batch. Each batch's leftover rows (those Jev does not settle) go to
+// Gemini at most GEMINI_ROWS_PER_REQUEST to a request, GEMINI_CONCURRENCY
+// requests at a time. Accuracy is flat from 25 to 225 rows a request; 50 keeps
+// each request near 20 seconds. 250 rows keeps a batch to about a minute even
+// when Gemini answers every row, so several fit in RUN_TIME_BUDGET_MS.
+const MAX_BATCH_SIZE = 250;
+const GEMINI_ROWS_PER_REQUEST = 50;
+const GEMINI_CONCURRENCY = 3;
+// A run keeps starting batches only while the next is expected to finish within
+// this. Apps Script stops a run at 6 minutes; this leaves a minute to spare.
+const RUN_TIME_BUDGET_MS = 5 * 60 * 1000;
 var TRANSACTION_SEARCHER = null;
 
-function categorizeUncategorizedTransactions() {
-  var uncategorizedTransactions = getTransactionsToCategorize();
+// --- Timing ------------------------------------------------------------------
+// Where a run's time goes, logged per batch and for the whole run. Each phase
+// accumulates the milliseconds spent inside timed(phase, fn).
+var RUN_TIMING = null;
 
-  var numTxnsToCategorize = uncategorizedTransactions.length;
-  if (numTxnsToCategorize == 0) {
-    Logger.log("No uncategorized transactions found");
-    return;
+// The phases, in the order they happen, with the label used in the log.
+const TIMING_PHASES = [
+  ["categories", "category list"],
+  ["query", "find uncategorized"],
+  ["assignIds", "assign missing ids"],
+  ["indexQuery", "query previous transactions"],
+  ["indexBuild", "build search index"],
+  ["similarSearch", "find previous transactions"],
+  ["jevRequests", "Jev requests"],
+  ["jevWrites", "write Jev matches"],
+  ["geminiRequests", "Gemini requests"],
+  ["geminiWrites", "write Gemini answers"],
+  ["logging", "logging"],
+];
+
+function startTiming(now) {
+  RUN_TIMING = { now: now, started: now(), phases: {}, firstWriteMs: null };
+}
+
+function timed(phase, fn) {
+  if (!RUN_TIMING) return fn();
+  var start = RUN_TIMING.now();
+  try {
+    return fn();
+  } finally {
+    RUN_TIMING.phases[phase] =
+      (RUN_TIMING.phases[phase] || 0) + (RUN_TIMING.now() - start);
+  }
+}
+
+// Records when the first answer of the run reached the sheet.
+function noteFirstWrite() {
+  if (RUN_TIMING && RUN_TIMING.firstWriteMs === null) {
+    RUN_TIMING.firstWriteMs = RUN_TIMING.now() - RUN_TIMING.started;
+  }
+}
+
+function timingSnapshot() {
+  var copy = {};
+  if (RUN_TIMING) {
+    for (var k in RUN_TIMING.phases) copy[k] = RUN_TIMING.phases[k];
+  }
+  return copy;
+}
+
+// "label 1.2s, label 0.4s, ..." for the phases that took any time between two
+// snapshots, plus whatever was not inside a timed phase.
+function describeTiming(before, after, elapsedMs) {
+  var seconds = function (ms) {
+    return (Math.round(ms / 100) / 10).toFixed(1) + "s";
+  };
+  var parts = [];
+  var accounted = 0;
+  TIMING_PHASES.forEach(function (phase) {
+    var ms = (after[phase[0]] || 0) - (before[phase[0]] || 0);
+    accounted += ms;
+    if (ms > 0) parts.push(phase[1] + " " + seconds(ms));
+  });
+  var other = elapsedMs - accounted;
+  if (other > 0) parts.push("other " + seconds(other));
+  return seconds(elapsedMs) + " total: " + parts.join(", ");
+}
+
+/**
+ * Categorizes uncategorized transactions in batches of up to MAX_BATCH_SIZE,
+ * starting another batch only while it is expected to finish within
+ * RUN_TIME_BUDGET_MS (Apps Script stops a run at 6 minutes). Each batch writes
+ * its results before the next starts, so a run that is stopped keeps what it
+ * finished.
+ *
+ * A row already tried in this run is not sent again in it - for instance one
+ * whose answer could not be written - and the run stops when a batch holds
+ * nothing new, or when the Gemini call fails.
+ *
+ * @param {Object=} options For tests: {budgetMs, now}. Apps Script passes an
+ *     event object when this runs from a trigger; anything else is ignored.
+ */
+function categorizeUncategorizedTransactions(options) {
+  var opts = options && typeof options.budgetMs === "number" ? options : {};
+  var now = typeof opts.now === "function" ? opts.now : function () {
+    return Date.now();
+  };
+  var budgetMs = typeof opts.budgetMs === "number" ? opts.budgetMs : RUN_TIME_BUDGET_MS;
+
+  startTiming(now);
+  // Progress lines before each step that waits on the network or the sheet, so
+  // a run that stalls shows where it stopped.
+  Logger.log("Run started.");
+  var started = now();
+  var longestBatchMs = 0;
+  var tried = Object.create(null);
+  Logger.log("Reading the category list...");
+  var categoryList = timed("categories", getAllowedCategories);
+  var batches = 0;
+  var categorized = 0;
+
+  for (;;) {
+    var batchStarted = now();
+    var timingBefore = timingSnapshot();
+
+    Logger.log("Querying the sheet for uncategorized transactions...");
+    var fetched = timed("query", getTransactionsToCategorize);
+    // Rows with no Transaction ID get one before they are sent; only then is
+    // the sheet scanned for them, and the query is re-run to pick up the ids.
+    var missingIds = fetched.some(function (t) {
+      return t.transaction_id === null || t.transaction_id === undefined ||
+        t.transaction_id === "";
+    });
+    if (missingIds) Logger.log("Assigning Transaction IDs to rows that have none...");
+    if (missingIds && timed("assignIds", assignMissingTransactionIds) > 0) {
+      Logger.log("Querying the sheet again for uncategorized transactions...");
+      fetched = timed("query", getTransactionsToCategorize);
+    }
+    var batch = fetched.filter(function (t) {
+      return !tried[t.transaction_id];
+    });
+
+    if (batch.length === 0) {
+      if (batches === 0) Logger.log("No uncategorized transactions found");
+      else if (fetched.length > 0) {
+        Logger.log(
+          fetched.length + " uncategorized transaction(s) were already tried in this run " +
+            "and could not be written; stopping."
+        );
+      }
+      break;
+    }
+
+    batches++;
+    batch.forEach(function (t) {
+      tried[t.transaction_id] = true;
+    });
+    Logger.log("--- Batch " + batches + " ---");
+    var result = categorizeBatch(batch, categoryList);
+    categorized += result.written;
+
+    var batchMs = now() - batchStarted;
+    longestBatchMs = Math.max(longestBatchMs, batchMs);
+    Logger.log(
+      "Batch " + batches + " timing (" + batch.length + " rows): " +
+        describeTiming(timingBefore, timingSnapshot(), batchMs)
+    );
+    if (result.geminiFailed) {
+      Logger.log("Stopping: the Gemini call failed.");
+      break;
+    }
+    if (fetched.length < MAX_BATCH_SIZE) break; // that was the last of them
+    if (now() - started + longestBatchMs > budgetMs) {
+      Logger.log(
+        "Stopping before batch " + (batches + 1) + " to stay within " +
+          Math.round(budgetMs / 1000) + "s; run again for the rest."
+      );
+      break;
+    }
   }
 
-  Logger.log("Found " + numTxnsToCategorize + " transactions to categorize");
+  if (batches > 0) {
+    Logger.log({
+      batches: batches,
+      answersWritten: categorized,
+      elapsedSeconds: Math.round((now() - started) / 1000),
+    });
+    Logger.log(
+      "Run timing: " + describeTiming({}, timingSnapshot(), now() - started) +
+        (RUN_TIMING.firstWriteMs !== null
+          ? "; first answer written after " +
+            (Math.round(RUN_TIMING.firstWriteMs / 100) / 10).toFixed(1) + "s"
+          : "")
+    );
+  }
+  RUN_TIMING = null;
+}
+
+/**
+ * One batch through the pipeline: find previous transactions, ask Jev (if
+ * configured) and write its matches, then ask Gemini about the rest and write
+ * its answers.
+ *
+ * @returns {{written: number, geminiFailed: boolean}}
+ */
+function categorizeBatch(uncategorizedTransactions, categoryList) {
+  Logger.log("Found " + uncategorizedTransactions.length + " transactions to categorize");
   Logger.log("Looking for historical similar transactions...");
 
   var transactionList = [];
   for (var i = 0; i < uncategorizedTransactions.length; i++) {
-    var similarTransactions = findSimilarTransactions(
-      uncategorizedTransactions[i][1]
+    var txn = uncategorizedTransactions[i];
+    var entry = {
+      transaction_id: txn.transaction_id,
+      original_description: txn.original_description,
+    };
+    if (txn.amount !== undefined) entry.amount = txn.amount;
+    if (txn.date) entry.date = txn.date;
+    entry.previous_transactions = findSimilarTransactions(
+      txn.original_description,
+      txn.amount
     );
+    transactionList.push(entry);
+  }
 
-    transactionList.push({
-      transaction_id: uncategorizedTransactions[i][0],
-      original_description: uncategorizedTransactions[i][1],
-      previous_transactions: similarTransactions,
+  timed("logging", function () {
+    Logger.log(
+      "Processing this set of transactions and similar transactions:"
+    );
+    Logger.log(transactionList);
+  });
+
+  // Stage 1 (optional): Jev settles the transactions that match a previous one.
+  var byPrecedent = {
+    suggestions: [],
+    decisions: [],
+    asked: 0,
+    taken: 0,
+    failed: 0,
+    cost: 0,
+  };
+  var openRouterKey = PropertiesService.getScriptProperties().getProperty(
+    OPENROUTER_API_KEY_PROPERTY
+  );
+  if (openRouterKey) {
+    Logger.log("Asking Jev (" + JEV_MODEL + ") which previous transaction matches...");
+    // Each group of parallel Jev requests is written as soon as it comes back,
+    // so a run that is stopped keeps every match it got.
+    byPrecedent = askPrecedents(
+      transactionList,
+      categoryList,
+      openRouterKey,
+      function (matches) {
+        Logger.log("Writing " + matches.length + " Jev match(es) into your sheet...");
+        timed("jevWrites", function () {
+          writeUpdatedTransactions(matches, categoryList);
+        });
+      }
+    );
+    Logger.log({
+      jevAsked: byPrecedent.asked,
+      jevTaken: byPrecedent.taken,
+      jevFailed: byPrecedent.failed,
+      jevCost: byPrecedent.cost,
+    });
+    timed("logging", function () {
+      if (byPrecedent.decisions.length > 0) {
+        // One line per transaction asked: what Jev chose, the probability that
+        // some option matches (1 - P(none), the number the take threshold is
+        // checked against), Jev's own confidence, and whether it was taken.
+        Logger.log("Jev decisions:");
+        Logger.log(byPrecedent.decisions);
+      }
+      if (byPrecedent.suggestions.length > 0) {
+        Logger.log("Jev matched these to a previous transaction:");
+        Logger.log(byPrecedent.suggestions);
+      }
     });
   }
 
-  Logger.log(
-    "Processing this set of transactions and similar transactions:"
-  );
-  Logger.log(transactionList);
+  // Stage 2: Gemini answers for everything Jev did not settle.
+  var taken = Object.create(null);
+  byPrecedent.suggestions.forEach(function (s) {
+    taken[s.transaction_id] = true;
+  });
+  var remaining = transactionList.filter(function (t) {
+    return !taken[t.transaction_id];
+  });
 
-  var categoryList = getAllowedCategories();
-
-  Logger.log("Using Gemini (" + GEMINI_MODEL + ") on Vertex AI");
-
-  var updatedTransactions = lookupDescAndCategoryGemini(
-    transactionList,
-    categoryList
-  );
-
-  if (updatedTransactions != null) {
+  var byGemini = [];
+  var geminiFailed = false;
+  if (remaining.length > 0) {
     Logger.log(
-      "Gemini returned the following sugested categories and descriptions:"
+      "Using Gemini (" + GEMINI_MODEL + ") on Vertex AI for " +
+        remaining.length + " transaction(s)"
     );
-    Logger.log(updatedTransactions);
-    Logger.log("Writing updated transactions into your sheet...");
-    writeUpdatedTransactions(updatedTransactions, categoryList);
+    // Likewise each group of parallel Gemini requests is written as it returns.
+    var gemini = lookupDescAndCategoryGemini(
+      remaining,
+      getPromptCategories(categoryList),
+      function (answers) {
+        Logger.log("Writing " + answers.length + " Gemini answer(s) into your sheet...");
+        timed("geminiWrites", function () {
+          writeUpdatedTransactions(answers, categoryList);
+        });
+      }
+    );
+    byGemini = gemini.answers;
+    if (gemini.failedRequests > 0) {
+      // Jev's matches and the other requests' answers are still written; the
+      // failed requests' rows stay uncategorized for the next run.
+      Logger.log(
+        gemini.failedRequests + " of " + gemini.requests + " Gemini request(s) failed."
+      );
+      geminiFailed = true;
+    }
+    if (byGemini.length > 0) {
+      timed("logging", function () {
+        Logger.log(
+          "Gemini returned the following sugested categories and descriptions:"
+        );
+        Logger.log(byGemini);
+      });
+    }
+  }
+
+  if (byPrecedent.suggestions.length > 0 || byGemini.length > 0) {
     Logger.log("Finished updating your sheet!");
   }
+
+  return {
+    written: byPrecedent.suggestions.length + byGemini.length,
+    geminiFailed: geminiFailed,
+  };
 }
 
-// Gets all transactions that have an original description but no category set
+/**
+ * Formats a sheet or gviz date value as YYYY-MM-DD. Sheet reads give Date
+ * objects (in the script's time zone); gviz gives strings like
+ * "Date(2026,7,14)" with a zero-based month. Anything else that is non-empty
+ * is passed through as text; empty values give "".
+ */
+function isoDate(value) {
+  if (value === null || value === undefined || value === "") return "";
+  var pad = function (n) {
+    return (n < 10 ? "0" : "") + n;
+  };
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    if (isNaN(value.getTime())) return "";
+    return (
+      value.getFullYear() + "-" + pad(value.getMonth() + 1) + "-" + pad(value.getDate())
+    );
+  }
+  var m = /^Date\((\d+),(\d+),(\d+)/.exec(String(value));
+  if (m) {
+    return m[1] + "-" + pad(Number(m[2]) + 1) + "-" + pad(Number(m[3]));
+  }
+  return String(value);
+}
+
+// Transaction IDs this script assigns, to rows it is about to send that have
+// none (usually rows added by hand). Tiller's own hand-entered rows use
+// "manual:<uuid>"; this prefix marks where these came from and cannot collide.
+const ASSIGNED_ID_PREFIX = "autocat:";
+
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+// A ULID: 10 characters of millisecond timestamp, then 16 of randomness, in
+// Crockford base 32. Sorts by creation time.
+function ulid(now) {
+  var time = now === undefined ? Date.now() : now;
+  var out = "";
+  for (var i = 0; i < 10; i++) {
+    out = CROCKFORD.charAt(time % 32) + out;
+    time = Math.floor(time / 32);
+  }
+  for (var j = 0; j < 16; j++) {
+    out += CROCKFORD.charAt(Math.floor(Math.random() * 32));
+  }
+  return out;
+}
+
+/**
+ * Gives a Transaction ID to every row this run is about to send that has none,
+ * so that its answer can be written back by id like any other row.
+ *
+ * "About to send" follows the same rule as getTransactionsToCategorize: rows
+ * with a Full Description and no Category, in sheet order, up to
+ * MAX_BATCH_SIZE of them. Only the empty Transaction ID cells of those rows are
+ * written (invariant (b)), and the writes are flushed so the gviz query that
+ * follows sees them.
+ *
+ * @returns {number} how many ids were assigned
+ */
+function assignMissingTransactionIds() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
+    TRANSACTION_SHEET_NAME
+  );
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var idColIdx = headers.indexOf(TRANSACTION_ID_COL_NAME);
+  var fullDescColIdx = headers.indexOf(ORIGINAL_DESCRIPTION_COL_NAME);
+  var catColIdx = headers.indexOf(CATEGORY_COL_NAME);
+  if (idColIdx === -1 || fullDescColIdx === -1 || catColIdx === -1) return 0;
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  var blank = function (v) {
+    return v === null || v === undefined || v === "";
+  };
+  var BATCH = 2000;
+  var cells = [];
+  var seen = 0;
+
+  for (var start = 2; start <= lastRow && seen < MAX_BATCH_SIZE; start += BATCH) {
+    var size = Math.min(BATCH, lastRow - start + 1);
+    var ids = sheet.getRange(start, idColIdx + 1, size, 1).getValues();
+    var descs = sheet.getRange(start, fullDescColIdx + 1, size, 1).getValues();
+    var cats = sheet.getRange(start, catColIdx + 1, size, 1).getValues();
+
+    for (var r = 0; r < size && seen < MAX_BATCH_SIZE; r++) {
+      if (blank(descs[r][0]) || !blank(cats[r][0])) continue;
+      seen++;
+      if (blank(ids[r][0])) {
+        cells.push({
+          row: start + r,
+          column: idColIdx + 1,
+          value: ASSIGNED_ID_PREFIX + ulid(),
+        });
+      }
+    }
+  }
+
+  if (cells.length === 0) return 0;
+
+  planCellWrites(cells).forEach(function (block) {
+    sheet
+      .getRange(block.row, block.column, block.values.length, block.values[0].length)
+      .setValues(block.values);
+  });
+  SpreadsheetApp.flush();
+
+  Logger.log(
+    "Assigned a Transaction ID to " + cells.length + " row(s) that had none: rows " +
+      cells.map(function (c) { return c.row; }).join(", ")
+  );
+  return cells.length;
+}
+
+// Gets up to MAX_BATCH_SIZE transactions that have an original description but
+// no category set, as {transaction_id, original_description, amount?, date}.
+// Amount and Date are optional columns, read only when present.
 function getTransactionsToCategorize() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
     TRANSACTION_SHEET_NAME
@@ -129,11 +572,16 @@ function getTransactionsToCategorize() {
     headers[headers.length - 1]
   );
 
+  // Invariant (a): optional columns resolve to "" and are left out of the query.
+  var amountColLetter = getColumnLetterFromColumnHeader(headers, AMOUNT_COL_NAME);
+  var dateColLetter = getColumnLetterFromColumnHeader(headers, DATE_COL_NAME);
+  var selected = [txnIDColLetter, origDescColLetter];
+  var amountAt = amountColLetter ? selected.push(amountColLetter) - 1 : -1;
+  var dateAt = dateColLetter ? selected.push(dateColLetter) - 1 : -1;
+
   var queryString =
     "SELECT " +
-    txnIDColLetter +
-    ", " +
-    origDescColLetter +
+    selected.join(", ") +
     " WHERE " +
     origDescColLetter +
     " is not null AND " +
@@ -148,61 +596,177 @@ function getTransactionsToCategorize() {
     "A:" + lastColLetter
   );
 
-  return uncategorizedTransactions;
+  return uncategorizedTransactions.map(function (row) {
+    var txn = { transaction_id: row[0], original_description: row[1] };
+    if (amountAt !== -1 && typeof row[amountAt] === "number") {
+      txn.amount = row[amountAt];
+    }
+    txn.date = dateAt !== -1 ? isoDate(row[dateAt]) : "";
+    return txn;
+  });
 }
 
+/**
+ * Builds the search index of previous transactions with one gviz query, so the
+ * sheet does the filtering: categorized rows dated within the last
+ * PRECEDENT_LOOKBACK_DAYS days, newest first, at most PRECEDENT_CAP of them.
+ * Only those rows are read into the script, however long the sheet is.
+ *
+ * Options are the TFIDFSearch tuning options (useStopWords, matchThreshold,
+ * minTermSize), plus `since` (a Date) to move the start of the window.
+ */
 function createSearchIndexWithStandardColumns(options) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
-    TRANSACTION_SHEET_NAME
-  );
+  options = options || {};
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = spreadsheet.getSheetByName(TRANSACTION_SHEET_NAME);
   var headers = sheet.getRange("1:1").getValues()[0];
+  var letter = function (name) {
+    return getColumnLetterFromColumnHeader(headers, name);
+  };
 
-  var idColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    TRANSACTION_ID_COL_NAME
-  );
-  var descColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    DESCRIPTION_COL_NAME
-  );
-  var origDescColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    ORIGINAL_DESCRIPTION_COL_NAME
-  );
-  var categoryColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    CATEGORY_COL_NAME
-  );
-  var dateColLetter = getColumnLetterFromColumnHeader(headers, DATE_COL_NAME);
-  var amountColLetter = getColumnLetterFromColumnHeader(
-    headers,
-    AMOUNT_COL_NAME
-  );
+  // Invariant (a): optional columns resolve to "" and are left out.
+  var columns = [
+    ["id", letter(TRANSACTION_ID_COL_NAME)],
+    ["text", letter(ORIGINAL_DESCRIPTION_COL_NAME)],
+    ["updatedText", letter(DESCRIPTION_COL_NAME)],
+    ["date", letter(DATE_COL_NAME)],
+    ["category", letter(CATEGORY_COL_NAME)],
+    ["amount", letter(AMOUNT_COL_NAME)],
+  ].filter(function (c) {
+    return c[1] !== "";
+  });
+  var at = {};
+  columns.forEach(function (c, i) {
+    at[c[0]] = i;
+  });
+  var dateLetter = letter(DATE_COL_NAME);
+  var since = Object.prototype.toString.call(options.since) === "[object Date]"
+    ? options.since
+    : lookbackStart(PRECEDENT_LOOKBACK_DAYS);
 
-  var searcher = createSearchIndex(
-    TRANSACTION_SHEET_NAME,
-    idColLetter, // ID Column
-    origDescColLetter, // text column
-    descColLetter, // updated text column
-    dateColLetter, // date column (for breaking ranking ties)
-    categoryColLetter, // category column
-    amountColLetter, // amount (used to disambiguate buys vs sells with the same description)
-    2,
-    options
-  );
+  var where = [letter(CATEGORY_COL_NAME) + " is not null"];
+  if (dateLetter) where.push(dateLetter + " >= date '" + isoDate(since) + "'");
+  var query =
+    "SELECT " +
+    columns.map(function (c) { return c[1]; }).join(", ") +
+    " WHERE " + where.join(" AND ") +
+    (dateLetter ? " ORDER BY " + dateLetter + " desc" : "") +
+    " LIMIT " + PRECEDENT_CAP;
 
-  return searcher;
+  Logger.log(
+    "Querying previous transactions" +
+      (dateLetter ? " since " + isoDate(since) : "") + "..."
+  );
+  var rows = timed("indexQuery", function () {
+    return Utils.gvizQuery(
+      spreadsheet.getId(),
+      query,
+      TRANSACTION_SHEET_NAME,
+      "A:" + getColumnLetterFromColumnHeader(headers, headers[headers.length - 1])
+    );
+  });
+
+  Logger.log("Building the search index from " + rows.length + " previous transaction(s)...");
+  return timed("indexBuild", function () {
+    return indexDocuments(rows, at, options);
+  });
 }
 
-function findSimilarTransactions(originalDescription) {
-  var limit = 3;
+// Turns the index query's rows into a TFIDFSearch: drops rows without a
+// category, converts gviz dates, and tokenizes every description.
+function indexDocuments(rows, at, options) {
+  var value = function (row, name) {
+    return at[name] === undefined ? undefined : row[at[name]];
+  };
+  var documents = [];
+  rows.forEach(function (row) {
+    var category = value(row, "category");
+    if (!category) return;
+    // gviz gives dates as "Date(2026,7,14)"; the search breaks ties on a Date.
+    var day = isoDate(value(row, "date"));
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+    documents.push({
+      id: value(row, "id"),
+      text: value(row, "text") || "",
+      updatedText: value(row, "updatedText") || "",
+      date: m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null,
+      category: category,
+      amount: value(row, "amount"),
+    });
+  });
+
+  return new TFIDFSearch(documents, {
+    useStopWords: options.useStopWords !== undefined ? options.useStopWords : true,
+    matchThreshold: options.matchThreshold !== undefined ? options.matchThreshold : 0.25,
+    minTermSize: options.minTermSize !== undefined ? options.minTermSize : 3,
+  });
+}
+
+/**
+ * Distance between two amounts for choosing previous transactions: how far
+ * apart they are on a log scale, or OPPOSITE_SIGN_DISTANCE when one is money
+ * in and the other money out.
+ */
+function amountDistance(a, b) {
+  return Math.sign(a) === Math.sign(b)
+    ? Math.abs(Math.log((Math.abs(a) + 1) / (Math.abs(b) + 1)))
+    : OPPOSITE_SIGN_DISTANCE;
+}
+
+/**
+ * Chooses up to `slots` previous transactions from TF-IDF hits ranked best
+ * first. Usually that is just the top `slots`. But when more hits than that tie
+ * exactly on score - every "CHECK #1234" looks the same to word overlap - the
+ * tied ones are re-ordered by how close their amount is, the closest of each
+ * category is taken first, and any free slots are filled from the same order.
+ */
+function closestByAmount(hits, amount, slots) {
+  if (hits.length === 0) return [];
+  var top = hits[0].score;
+  var tied = hits.filter(function (hit) {
+    return hit.score >= top * EXACT_TIE;
+  });
+  if (tied.length <= slots) return hits.slice(0, slots);
+
+  var amountOf = function (hit) {
+    return typeof hit.amount === "number" ? hit.amount : 0;
+  };
+  // Array.prototype.sort is stable in V8, so equal distances keep rank order.
+  var ranked = tied.slice().sort(function (a, b) {
+    return amountDistance(amountOf(a), amount) - amountDistance(amountOf(b), amount);
+  });
+
+  var chosen = [];
+  var categories = Object.create(null);
+  ranked.forEach(function (hit) {
+    var category = hit.category || "";
+    if (chosen.length < slots && !categories[category]) {
+      categories[category] = true;
+      chosen.push(hit);
+    }
+  });
+  ranked.forEach(function (hit) {
+    if (chosen.length < slots && chosen.indexOf(hit) === -1) chosen.push(hit);
+  });
+  return ranked.filter(function (hit) {
+    return chosen.indexOf(hit) !== -1;
+  });
+}
+
+function findSimilarTransactions(originalDescription, amount) {
   if (TRANSACTION_SEARCHER === null) {
     TRANSACTION_SEARCHER = createSearchIndexWithStandardColumns({
       minTermSize: 3,
     });
   }
 
-  const results = TRANSACTION_SEARCHER.search(originalDescription, limit);
+  const results = timed("similarSearch", function () {
+    return closestByAmount(
+      TRANSACTION_SEARCHER.search(originalDescription, PRECEDENT_CANDIDATES),
+      typeof amount === "number" ? amount : 0,
+      EXAMPLES_PER_ROW
+    );
+  });
 
   var previousTransactionList = [];
   results.forEach(function (result, index) {
@@ -211,6 +775,7 @@ function findSimilarTransactions(originalDescription) {
       updated_description: result.updatedText,
       category: result.category,
       amount: result.amount,
+      date: isoDate(result.date),
     });
   });
 
@@ -458,6 +1023,7 @@ function writeUpdatedTransactions(transactionList, categoryList) {
     }
   }
 
+  noteFirstWrite();
   Logger.log(
     "Success: Updated " +
       numFound +
@@ -494,6 +1060,220 @@ function getAllowedCategories() {
   return categoryList;
 }
 
+// The category list as the model sees it: [{name, group}], in sheet order. The
+// group comes from the Categories sheet's Group column and is left off when
+// that column is absent or the cell is blank. Names, not ids, are what the
+// model reads and answers with.
+function getPromptCategories(categoryList) {
+  var categorySheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
+    CATEGORY_SHEET_NAME
+  );
+  var groupOf = Object.create(null);
+
+  if (categorySheet) {
+    var headers = categorySheet.getRange("1:1").getValues()[0];
+    var categoryColLetter = getColumnLetterFromColumnHeader(headers, CATEGORY_COL_NAME);
+    var groupColLetter = getColumnLetterFromColumnHeader(headers, GROUP_COL_NAME);
+
+    if (categoryColLetter && groupColLetter) {
+      var names = categorySheet
+        .getRange(categoryColLetter + "2:" + categoryColLetter)
+        .getValues();
+      var groups = categorySheet
+        .getRange(groupColLetter + "2:" + groupColLetter)
+        .getValues();
+      for (var i = 0; i < names.length; i++) {
+        var name = names[i][0];
+        var group = groups[i] && groups[i][0];
+        if (name !== "" && name !== null && group !== "" && group != null) {
+          groupOf[name] = String(group);
+        }
+      }
+    }
+  }
+
+  return categoryList.map(function (name) {
+    var entry = { name: name };
+    if (groupOf[name]) entry.group = groupOf[name];
+    return entry;
+  });
+}
+
+// The description to copy from a previous transaction: its cleaned-up
+// Description, or the raw text when it has none.
+function displayDescription(previous) {
+  return previous.updated_description || previous.original_description || "";
+}
+
+/**
+ * Builds the Jev request for one transaction: the transaction as the state, its
+ * previous transactions as options p1..pN, plus "none". Jev sees raw bank text
+ * on both sides and the category by name; the cleaned description is not shown,
+ * it is what gets copied from the option Jev picks.
+ */
+function precedentRequest(transaction) {
+  var state = {
+    transaction: { bank_description: transaction.original_description },
+  };
+  if (transaction.amount !== undefined) state.transaction.amount = transaction.amount;
+  if (transaction.date) state.transaction.date = transaction.date;
+
+  var criteria = {};
+  transaction.previous_transactions.forEach(function (p, i) {
+    criteria["p" + (i + 1)] = {
+      bank_description: p.original_description,
+      category: p.category,
+      amount: p.amount,
+      date: p.date,
+    };
+  });
+  criteria[JEV_NONE] = JEV_NONE_OPTION;
+
+  return {
+    model: JEV_MODEL,
+    state: state,
+    questions: {
+      precedent: {
+        type: "choice",
+        instructions: JEV_INSTRUCTIONS,
+        criteria: criteria,
+      },
+    },
+  };
+}
+
+/**
+ * Reads Jev's answer and returns the previous transaction it picked, or null
+ * when it chose none, picked something unrecognised, or was not sure enough.
+ */
+function takenPrecedent(answer, previous) {
+  if (!answer || typeof answer.choice !== "string") return null;
+  if (answer.choice === JEV_NONE) return null;
+  var m = /^p(\d+)$/.exec(answer.choice);
+  if (!m) return null;
+  var picked = previous[Number(m[1]) - 1];
+  if (!picked) return null;
+  var none = answer.probabilities && answer.probabilities[JEV_NONE];
+  var matchProbability = 1 - (typeof none === "number" ? none : 0);
+  return matchProbability >= JEV_TAKE_THRESHOLD ? picked : null;
+}
+
+/**
+ * A one-line summary of Jev's answer for the log: the raw description, the
+ * option it chose (with that option's category), the match probability
+ * 1 - P(none), Jev's confidence, and whether the pick was taken.
+ */
+function jevDecision(transaction, answer, taken) {
+  var round = function (n) {
+    return typeof n === "number" ? Math.round(n * 1000) / 1000 : null;
+  };
+  var choice = answer && typeof answer.choice === "string" ? answer.choice : "";
+  var m = /^p(\d+)$/.exec(choice);
+  var option = m ? transaction.previous_transactions[Number(m[1]) - 1] : null;
+  var none = answer && answer.probabilities && answer.probabilities[JEV_NONE];
+  return {
+    transaction_id: transaction.transaction_id,
+    description: transaction.original_description,
+    choice: choice + (option ? " (" + option.category + ")" : ""),
+    match: round(1 - (typeof none === "number" ? none : 0)),
+    confidence: round(answer && answer.confidence),
+    taken: taken,
+  };
+}
+
+/**
+ * Stage 1: asks Jev, through OpenRouter, which previous transaction each
+ * transaction matches. Only transactions with previous transactions are asked,
+ * JEV_CONCURRENCY at a time. A pick is taken only when its category is still on
+ * the allowed list and is not FALLBACK_CATEGORY - copying a "To Be Categorized"
+ * would just repeat an earlier non-answer, so those go on to Gemini.
+ *
+ * A failed request is counted and that transaction falls through to Gemini.
+ *
+ * onMatches (optional) is called with each group's matches as soon as that
+ * group of requests returns, so they can be written right away.
+ *
+ * @returns {{suggestions: Array, asked: number, taken: number, failed: number, cost: number}}
+ */
+function askPrecedents(transactionList, categoryList, apiKey, onMatches) {
+  var candidates = transactionList.filter(function (t) {
+    return t.previous_transactions && t.previous_transactions.length > 0;
+  });
+  var suggestions = [];
+  var decisions = [];
+  var failed = 0;
+  var cost = 0;
+
+  for (var at = 0; at < candidates.length; at += JEV_CONCURRENCY) {
+    var chunk = candidates.slice(at, at + JEV_CONCURRENCY);
+    Logger.log(
+      "Sending Jev requests " + (at + 1) + "-" + (at + chunk.length) +
+        " of " + candidates.length + "..."
+    );
+    var responses = timed("jevRequests", function () {
+      return UrlFetchApp.fetchAll(
+      chunk.map(function (t) {
+        return {
+          url: JEV_URL,
+          method: "post",
+          contentType: "application/json",
+          headers: { Authorization: "Bearer " + apiKey },
+          payload: JSON.stringify(precedentRequest(t)),
+          muteHttpExceptions: true,
+        };
+      })
+      );
+    });
+
+    var chunkMatches = [];
+    for (var i = 0; i < chunk.length; i++) {
+      var json = null;
+      try {
+        json = JSON.parse(responses[i].getContentText());
+      } catch (e) {}
+
+      if (responses[i].getResponseCode() != 200 || !json || json.error) {
+        failed++;
+        Logger.log(
+          "Jev request failed for " + chunk[i].transaction_id + " (HTTP " +
+            responses[i].getResponseCode() + "): " +
+            String(responses[i].getContentText()).slice(0, 300)
+        );
+        continue;
+      }
+
+      if (json.usage && typeof json.usage.cost === "number") cost += json.usage.cost;
+
+      var answer = json.answers && json.answers.precedent;
+      var picked = takenPrecedent(answer, chunk[i].previous_transactions);
+      var take =
+        !!picked &&
+        picked.category !== FALLBACK_CATEGORY &&
+        categoryList.includes(picked.category);
+      decisions.push(jevDecision(chunk[i], answer, take));
+      if (take) {
+        chunkMatches.push({
+          transaction_id: chunk[i].transaction_id,
+          updated_description: displayDescription(picked),
+          category: picked.category,
+        });
+      }
+    }
+
+    suggestions = suggestions.concat(chunkMatches);
+    if (onMatches && chunkMatches.length > 0) onMatches(chunkMatches);
+  }
+
+  return {
+    suggestions: suggestions,
+    decisions: decisions,
+    asked: candidates.length,
+    taken: suggestions.length,
+    failed: failed,
+    cost: cost,
+  };
+}
+
 // Resolves a column header name to its A1 column letter, supporting invariant (a).
 // Returns "" when the column is not present, so callers testing for an optional
 // column must check truthiness rather than comparing against null.
@@ -514,7 +1294,146 @@ function getColumnLetterFromColumnHeader(columnHeaders, columnName) {
   return columnLetter;
 }
 
-function lookupDescAndCategoryGemini(transactionList, categoryList) {
+// The categorizer prompt. Categories are given by name, and the previous
+// transactions are this sheet's own earlier decisions.
+const GEMINI_SYSTEM_PROMPT = `Act as an API that cleans up bank transaction descriptions and files them into
+a household's own categories. Respond with ONLY JSON.
+
+The input JSON has this shape:
+{"allowed_categories": [{"name": "...", "group": "..."}],
+ "transactions": [
+   {"transaction_id": "...",
+    "original_description": "the raw bank description",
+    "amount": 12.34,
+    "date": "2026-08-14",
+    "previous_transactions": [
+      {"bank_description": "the raw bank description",
+       "description": "...", "category": "Groceries",
+       "amount": 1.23, "date": "2026-07-14"}
+    ]}
+ ]}
+
+original_description is raw text straight from the bank. Each previous
+transaction carries its own raw text as bank_description, so match
+original_description against bank_description, raw against raw: the same
+merchant or payee recurs with the same words, minus store numbers, dates and
+reference codes. A previous transaction's description is NOT raw: it is the
+cleaned-up name this household already uses for that transaction, and it is
+the wording to reuse. Its category is the name of the household category it was
+filed in, as it appears in allowed_categories.
+
+amount is signed from the account holder's point of view: negative means money
+left the account, positive means money arrived.
+
+previous_transactions are this household's own earlier decisions, found by word
+overlap with the raw description. They are the strongest signal available,
+because they are how this household has chosen to name and file this kind of
+transaction.
+
+For each transaction, answer with both an updated_description and a category.
+
+Choosing updated_description:
+(1) If a previous transaction's bank_description plausibly is the same merchant
+    or the same recurring payment, reuse its description EXACTLY, including
+    capitalization and punctuation. Consistency matters more than your own
+    phrasing.
+(2) Otherwise write a friendly, human-readable name for the transaction. The
+    raw description usually contains a merchant; if you recognize it, use that
+    merchant's proper name.
+(3) Keep it as simple as possible. Remove punctuation, extraneous numbers,
+    location information, abbreviations like "Inc." or "LLC", store and
+    reference numbers, and account numbers.
+(4) If the raw description tells you nothing you can clean up, return it
+    unchanged rather than inventing a merchant.
+
+Choosing category, in this order:
+(1) If the previous transactions that plausibly are the same merchant or the
+    same recurring payment agree on a category, use that category.
+(2) If they disagree, prefer the one closest in amount and in day of the month.
+    Recurring bills land at the same point in the month for similar amounts.
+(3) If no previous transaction convinces you, fall back on general knowledge of
+    the merchant, using the sign of the amount as a hint.
+(4) If you are still unsure, answer "${DECLINED_CATEGORY}" for that transaction.
+    Leaving it for a person is a better outcome than a wrong category.
+
+Answering "${DECLINED_CATEGORY}" for the category does not excuse you from
+cleaning the description: give your best updated_description either way.
+
+Answer for EVERY transaction you were given, in the order you were given them.
+"${DECLINED_CATEGORY}" is how you decline; a missing entry is not, and is read as
+an answer that went astray.
+
+Every other category you return must be the "name" of an entry in
+allowed_categories, spelled exactly as given. Never invent one.
+
+Respond with a JSON object of exactly this form and no other text:
+{"suggested_transactions": [
+  {"transaction_id": "...", "updated_description": "...", "category": "..."}
+]}
+`;
+
+// Vertex AI's structured-output schema for the answer above.
+const GEMINI_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  required: ["suggested_transactions"],
+  properties: {
+    suggested_transactions: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        required: ["transaction_id", "updated_description", "category"],
+        propertyOrdering: ["transaction_id", "updated_description", "category"],
+        properties: {
+          transaction_id: { type: "STRING" },
+          updated_description: { type: "STRING" },
+          category: { type: "STRING" },
+        },
+      },
+    },
+  },
+};
+
+/**
+ * The user message for Gemini: the allowed categories and, per transaction,
+ * its raw description, amount and date, plus its previous transactions as
+ * {bank_description (raw), description (cleaned), category (name), amount, date}.
+ */
+function geminiPayload(transactionList, promptCategories) {
+  return {
+    allowed_categories: promptCategories,
+    transactions: transactionList.map(function (t) {
+      var entry = {
+        transaction_id: t.transaction_id,
+        original_description: t.original_description,
+      };
+      if (t.amount !== undefined) entry.amount = t.amount;
+      if (t.date) entry.date = t.date;
+      entry.previous_transactions = (t.previous_transactions || []).map(
+        function (p) {
+          return {
+            bank_description: p.original_description,
+            description: displayDescription(p),
+            category: p.category,
+            amount: p.amount,
+            date: p.date,
+          };
+        }
+      );
+      return entry;
+    }),
+  };
+}
+
+/**
+ * Asks Gemini on Vertex AI for a description and category for each
+ * transaction: GEMINI_ROWS_PER_REQUEST to a request, GEMINI_CONCURRENCY
+ * requests at a time. A request that fails is logged and its rows are left
+ * out; the rest still come back. onAnswers (optional) is called with each
+ * group's answers as soon as that group returns.
+ *
+ * @returns {{answers: Array, failedRequests: number, requests: number}}
+ */
+function lookupDescAndCategoryGemini(transactionList, promptCategories, onAnswers) {
   const projectId = PropertiesService.getScriptProperties().getProperty(
     GCP_PROJECT_ID_PROPERTY
   );
@@ -527,76 +1446,8 @@ function lookupDescAndCategoryGemini(transactionList, categoryList) {
         "Project Settings -> Script Properties and add it, using your Google " +
         "Cloud project ID as the value. See the README for full setup steps."
     );
-    return null;
+    return { answers: [], failedRequests: 1, requests: 0 };
   }
-
-  var transactionDict = {
-    transactions: transactionList,
-  };
-
-  const request = {
-    systemInstruction: {
-      parts: [
-        {
-          text: `
-        Act as an API that categorizes and cleans up bank transaction descriptions for for a personal finance app. Respond with only JSON.
-
-        Reference the following list of allowed_categories:
-        ${JSON.stringify(categoryList)}
-
-        You will be given JSON input with a list of transaction descriptions and potentially related previously categorized transactions in the following format:
-            {"transactions": [
-              {
-                "transaction_id": "A unique ID for this transaction"
-                "original_description": "The original raw transaction description",
-                "previous_transactions": "(optional) Previously cleaned up transaction descriptions and the prior 
-                category used that may be related to this transaction
-              }
-            ]}
-            For each transaction provided, follow these instructions:
-            (0) If previous_transactions were provided, see if the current transaction matches a previous one closely.
-                If it does, use the updated_description and category of the previous transaction exactly,
-                including capitalization and punctuation.
-            (1) If there is no matching previous_transaction, or none was provided suggest a better “updated_description” according to the following rules:
-            (a) Use all of your knowledge and information to propose a friendly, human readable updated_description for the
-              transaction given the original_description. The input often contains the name of a merchant name.
-              If you know of a merchant it might be referring to, use the name of that merchant for the suggested description.
-            (b) Keep the suggested description as simple as possible. Remove punctuation, extraneous
-              numbers, location information, abbreviations such as "Inc." or "LLC", IDs and account numbers.
-            (2) For each original_description, suggest a “category” for the transaction from the allowed_categories list that was provided.
-            (3) If you are not confident in the suggested category after using your own knowledge and the previous transactions provided, use the cateogry "${FALLBACK_CATEGORY}"
-            (4) Your response should be a JSON object and no other text.  The response object should be of the form:
-            {"suggested_transactions": [
-              {
-                "transaction_id": "The unique ID previously provided for this transaction",
-                "updated_description": "The cleaned up version of the description",
-                "category": "A category selected from the allowed_categories list"
-              }
-            ]}
-        `,
-        },
-      ],
-    },
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: JSON.stringify(transactionDict) }],
-      },
-    ],
-    generationConfig: {
-      responseMimeType: "application/json",
-    },
-  };
-
-  const options = {
-    method: "POST",
-    contentType: "application/json",
-    // Application Default Credentials: this token belongs to whoever is running
-    // the script, and Vertex AI checks their IAM role on GCP_PROJECT_ID.
-    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-    payload: JSON.stringify(request),
-    muteHttpExceptions: true,
-  };
 
   // Regional endpoints are prefixed with the region; the 'global' endpoint is not.
   const host =
@@ -615,10 +1466,88 @@ function lookupDescAndCategoryGemini(transactionList, categoryList) {
     GEMINI_MODEL +
     ":generateContent";
 
-  const startTime = new Date().getTime();
-  const response = UrlFetchApp.fetch(url, options);
-  const elapsedTime = new Date().getTime() - startTime;
+  const chunks = [];
+  for (var at = 0; at < transactionList.length; at += GEMINI_ROWS_PER_REQUEST) {
+    chunks.push(transactionList.slice(at, at + GEMINI_ROWS_PER_REQUEST));
+  }
 
+  var answers = [];
+  var failedRequests = 0;
+
+  for (var g = 0; g < chunks.length; g += GEMINI_CONCURRENCY) {
+    var group = chunks.slice(g, g + GEMINI_CONCURRENCY);
+    Logger.log(
+      "Sending Gemini requests " + (g + 1) + "-" + (g + group.length) +
+        " of " + chunks.length + "..."
+    );
+    var startTime = new Date().getTime();
+    var responses = timed("geminiRequests", function () {
+      return UrlFetchApp.fetchAll(
+        group.map(function (chunk) {
+          return geminiFetchRequest(url, chunk, promptCategories);
+        })
+      );
+    });
+    var elapsedTime = new Date().getTime() - startTime;
+
+    var groupAnswers = [];
+    for (var i = 0; i < group.length; i++) {
+      var parsed = parseGeminiResponse(responses[i], group[i].length, elapsedTime);
+      if (parsed === null) {
+        failedRequests++;
+      } else {
+        groupAnswers = groupAnswers.concat(parsed);
+      }
+    }
+    answers = answers.concat(groupAnswers);
+    if (onAnswers && groupAnswers.length > 0) onAnswers(groupAnswers);
+  }
+
+  return {
+    answers: answers,
+    failedRequests: failedRequests,
+    requests: chunks.length,
+  };
+}
+
+// One Vertex AI generateContent request, in UrlFetchApp.fetchAll's form.
+function geminiFetchRequest(url, transactionList, promptCategories) {
+  const request = {
+    systemInstruction: {
+      parts: [{ text: GEMINI_SYSTEM_PROMPT }],
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: JSON.stringify(geminiPayload(transactionList, promptCategories)) },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: GEMINI_TEMPERATURE,
+      maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
+      responseMimeType: "application/json",
+      responseSchema: GEMINI_RESPONSE_SCHEMA,
+      thinkingConfig: { thinkingLevel: GEMINI_THINKING_LEVEL },
+    },
+  };
+
+  return {
+    url: url,
+    method: "post",
+    contentType: "application/json",
+    // Application Default Credentials: this token belongs to whoever is running
+    // the script, and Vertex AI checks their IAM role on GCP_PROJECT_ID.
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    payload: JSON.stringify(request),
+    muteHttpExceptions: true,
+  };
+}
+
+// Reads one Vertex AI response: the suggested_transactions array, or null
+// (after logging why) when the request failed or the answer cannot be read.
+function parseGeminiResponse(response, numTransactions, elapsedTime) {
   const responseCode = response.getResponseCode();
   const responseText = response.getContentText();
 
@@ -629,13 +1558,19 @@ function lookupDescAndCategoryGemini(transactionList, categoryList) {
     return null;
   }
 
-  const parsedResponse = JSON.parse(responseText);
+  var parsedResponse;
+  try {
+    parsedResponse = JSON.parse(responseText);
+  } catch (e) {
+    Logger.log("Could not read the Vertex AI response: " + responseText.slice(0, 500));
+    return null;
+  }
   if ("error" in parsedResponse) {
     Logger.log("Error from Vertex AI: " + JSON.stringify(parsedResponse.error));
     return null;
   }
 
-  logUsageStats(parsedResponse.usageMetadata, transactionList.length, elapsedTime);
+  logUsageStats(parsedResponse.usageMetadata, numTransactions, elapsedTime);
 
   const candidate = parsedResponse.candidates && parsedResponse.candidates[0];
   const parts = candidate && candidate.content && candidate.content.parts;
@@ -648,13 +1583,26 @@ function lookupDescAndCategoryGemini(transactionList, categoryList) {
 
   // responseMimeType asks for bare JSON, but trim anything outside the outermost
   // braces in case the model still wraps it in prose or a code fence.
-  const rawText = parts[0].text;
+  // Thought summaries, if the model ever returns them, are marked `thought`;
+  // the answer is in the other parts.
+  const rawText = parts
+    .filter(function (part) {
+      return !part.thought && typeof part.text === "string";
+    })
+    .map(function (part) {
+      return part.text;
+    })
+    .join("");
   const jsonStart = rawText.indexOf("{");
   const jsonEnd = rawText.lastIndexOf("}") + 1; // +1 to include the closing brace
-  const cleanText = rawText.substring(jsonStart, jsonEnd);
 
-  const apiResponse = JSON.parse(cleanText);
-  return apiResponse["suggested_transactions"];
+  try {
+    const apiResponse = JSON.parse(rawText.substring(jsonStart, jsonEnd));
+    return apiResponse["suggested_transactions"] || [];
+  } catch (e) {
+    Logger.log("Could not read Gemini's answer: " + rawText.slice(0, 500));
+    return null;
+  }
 }
 
 function logUsageStats(usage, numTransactions, elapsedTime) {

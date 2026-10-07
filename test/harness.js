@@ -318,6 +318,71 @@ class FakeSpreadsheet {
 }
 
 /**
+ * Answers a gviz query against a FakeSheet, for the query forms the script
+ * uses: SELECT of column letters, WHERE of "X is null", "X is not null" and
+ * "X >= date 'YYYY-MM-DD'" joined by AND, optional ORDER BY X asc|desc, and
+ * LIMIT. Blank cells are null; dates come back as gviz's "Date(y,m,d)".
+ */
+function gvizFromSheet(sheet, query) {
+  const m = /^SELECT (.+?) WHERE (.+?)(?: ORDER BY ([A-Z]+) (asc|desc))?(?: LIMIT (\d+))?$/.exec(query);
+  if (!m) throw new Error("gviz emulator cannot read: " + query);
+  const cols = m[1].split(",").map((c) => columnLetterToIndex(c.trim()));
+  const isNull = (v) => v === "" || v === null || v === undefined;
+  const day = (v) => {
+    if (!(v instanceof Date)) return null;
+    const pad = (n) => (n < 10 ? "0" : "") + n;
+    return v.getFullYear() + "-" + pad(v.getMonth() + 1) + "-" + pad(v.getDate());
+  };
+  const conditions = m[2].split(" AND ").map((c) => {
+    let x;
+    if ((x = /^([A-Z]+) is not null$/.exec(c))) {
+      const i = columnLetterToIndex(x[1]);
+      return (row) => !isNull(row[i]);
+    }
+    if ((x = /^([A-Z]+) is null$/.exec(c))) {
+      const i = columnLetterToIndex(x[1]);
+      return (row) => isNull(row[i]);
+    }
+    if ((x = /^([A-Z]+) >= date '(\d{4}-\d{2}-\d{2})'$/.exec(c))) {
+      const i = columnLetterToIndex(x[1]);
+      return (row) => day(row[i]) !== null && day(row[i]) >= x[2];
+    }
+    throw new Error("gviz emulator cannot read condition: " + c);
+  });
+  let rows = sheet.data.slice(1).filter((row) => conditions.every((f) => f(row)));
+  if (m[3]) {
+    const i = columnLetterToIndex(m[3]);
+    const dir = m[4] === "desc" ? -1 : 1;
+    rows = rows
+      .map((row, at) => ({ row, at }))
+      .sort((a, b) => {
+        const av = a.row[i] instanceof Date ? a.row[i].getTime() : -Infinity;
+        const bv = b.row[i] instanceof Date ? b.row[i].getTime() : -Infinity;
+        return av === bv ? a.at - b.at : (av - bv) * dir;
+      })
+      .map((x) => x.row);
+  }
+  if (m[5]) rows = rows.slice(0, Number(m[5]));
+  const cell = (v) =>
+    isNull(v)
+      ? null
+      : v instanceof Date
+      ? { v: "Date(" + v.getFullYear() + "," + v.getMonth() + "," + v.getDate() + ")" }
+      : { v };
+  const table = {
+    cols: cols.map((i) => ({ label: columnIndexToLetter(i) })),
+    rows: rows.map((row) => ({ c: cols.map((i) => cell(row[i])) })),
+  };
+  return "/*O_o*/\ngoogle.visualization.Query.setResponse(" + JSON.stringify({ table }) + ");";
+}
+
+// The search-index query: it selects categorized rows and has no "is null"
+// condition of its own. Every other gviz query is left to the test's stub.
+function isIndexQuery(query) {
+  return / is not null/.test(query) && !/(?<!not) is null/.test(query);
+}
+
+/**
  * Builds a context with the Apps Script globals stubbed, loads the given source
  * files into it, and returns the context plus the captured log.
  */
@@ -334,6 +399,9 @@ function loadScripts(sources, opts) {
     },
     SpreadsheetApp: {
       getActiveSpreadsheet: () => options.spreadsheet || null,
+      flush: () => {
+        if (options.onFlush) options.onFlush();
+      },
       getUi: () => ({
         createMenu: () => ({ addItem: () => ({ addToUi: () => {} }) }),
       }),
@@ -350,12 +418,27 @@ function loadScripts(sources, opts) {
       getOAuthToken: () => "fake-oauth-token",
     },
     UrlFetchApp: {
-      fetch: (url, params) =>
-        options.fetch
-          ? options.fetch(url, params)
-          : (() => {
-              throw new Error("Unexpected UrlFetchApp.fetch call to " + url);
-            })(),
+      fetch: (url, params) => {
+        // The search index's gviz query is answered from the fake sheet, so
+        // every test builds its index from the sheet's own rows.
+        const q = /[?&]tq=([^&]*)/.exec(url);
+        const query = q ? decodeURIComponent(q[1]) : "";
+        const sheet =
+          options.spreadsheet && options.spreadsheet.getSheetByName("Transactions");
+        if (url.includes("/gviz/") && sheet && isIndexQuery(query)) {
+          if (options.onIndexQuery) options.onIndexQuery(query);
+          const text = gvizFromSheet(sheet, query);
+          return { getContentText: () => text };
+        }
+        if (options.fetch) return options.fetch(url, params);
+        throw new Error("Unexpected UrlFetchApp.fetch call to " + url);
+      },
+      // Without a fetchAll stub, each request goes to the fetch stub, the same
+      // as if it had been fetched on its own.
+      fetchAll: (requests) =>
+        options.fetchAll
+          ? options.fetchAll(requests)
+          : requests.map((r) => sandbox.UrlFetchApp.fetch(r.url, r)),
     },
     Utilities: {
       formatString: (fmt, ...args) => {
@@ -386,6 +469,7 @@ function readAtRevision(file, revision) {
 }
 
 module.exports = {
+  gvizFromSheet,
   FakeSheet,
   FakeSpreadsheet,
   FakeRange,
