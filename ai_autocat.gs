@@ -252,6 +252,57 @@ function isoDate(value) {
 // Stand-in transaction ids for rows that have none; see getTransactionsToCategorize.
 const NO_ID_PREFIX = "no-id-";
 
+// Helpers for finding a row with no Transaction ID by its contents. What the
+// gviz query returned and what the sheet holds can differ in small ways - extra
+// spaces, a blank-looking cell that is not empty, an amount stored with more
+// decimal places than it shows, or a date read in a different time zone - so
+// text, blanks and amounts are compared loosely and dates by the sheet's day.
+function isBlankCell(value) {
+  return value === null || value === undefined || String(value).trim() === "";
+}
+
+function sameText(a, b) {
+  var norm = function (v) {
+    return String(v === null || v === undefined ? "" : v).replace(/\s+/g, " ").trim();
+  };
+  return norm(a) === norm(b);
+}
+
+function sameAmount(a, b) {
+  var cents = function (v) {
+    var n = typeof v === "number" ? v : Number(String(v).replace(/[$,\s]/g, ""));
+    return isNaN(n) ? null : Math.round(n * 100);
+  };
+  return cents(a) !== null && cents(a) === cents(b);
+}
+
+// The day a sheet date falls on, as YYYY-MM-DD in the spreadsheet's own time
+// zone. That is the day gviz reports; a Date read from the sheet is formatted
+// in the script's time zone by isoDate, which can be a day off when the two
+// differ.
+function sheetDay(value) {
+  if (
+    Object.prototype.toString.call(value) === "[object Date]" &&
+    typeof Utilities.formatDate === "function"
+  ) {
+    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    var zone = spreadsheet.getSpreadsheetTimeZone && spreadsheet.getSpreadsheetTimeZone();
+    if (zone) return Utilities.formatDate(value, zone, "yyyy-MM-dd");
+  }
+  return isoDate(value);
+}
+
+function sameDay(sheetValue, isoWanted) {
+  return sheetDay(sheetValue) === isoWanted;
+}
+
+// Describes a cell's value and type for the log, so a mismatch can be diagnosed.
+function describeCell(value) {
+  if (value === null || value === undefined) return String(value);
+  var type = Object.prototype.toString.call(value) === "[object Date]" ? "date" : typeof value;
+  return JSON.stringify(type === "date" ? value.toISOString() : value) + " (" + type + ")";
+}
+
 // Gets up to MAX_BATCH_SIZE transactions that have an original description but
 // no category set, as {transaction_id, original_description, amount?, date}.
 // Amount and Date are optional columns, read only when present.
@@ -600,6 +651,7 @@ function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
   // --- STEP 2: Progressive ID Loading ---
   // Read IDs in batches until we find all target transactions
   var foundRows = {}; // txId -> sheet row number (1-indexed)
+  var noIdLookalikes = []; // for the log, when a row with no id is not found
   var numFound = 0;
   var rowOffset = 2; // Start after header (row 1)
 
@@ -622,24 +674,38 @@ function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
     for (var b = 0; b < idBatch.length; b++) {
       var id = idBatch[b][0];
 
-      if (id === "" && noIdColumns && noIdColumns.category[b][0] === "") {
+      if (noIdColumns) {
         for (var p = 0; p < pendingNoId.length; p++) {
           var want = noIdRows[pendingNoId[p]];
-          if (
-            noIdColumns.fullDesc[b][0] === want.original_description &&
+          if (!sameText(noIdColumns.fullDesc[b][0], want.original_description)) {
+            continue;
+          }
+          var matches =
+            isBlankCell(id) &&
+            isBlankCell(noIdColumns.category[b][0]) &&
             (!want.date || !noIdColumns.date ||
-              isoDate(noIdColumns.date[b][0]) === want.date) &&
+              sameDay(noIdColumns.date[b][0], want.date)) &&
             (want.amount === undefined || !noIdColumns.amount ||
-              noIdColumns.amount[b][0] === want.amount)
-          ) {
+              sameAmount(noIdColumns.amount[b][0], want.amount));
+          if (matches) {
             foundRows[pendingNoId[p]] = rowOffset + b;
             pendingNoId.splice(p, 1);
             numFound++;
             break;
           }
+          // Same Full Description but not a match: keep a few for the log.
+          if (noIdLookalikes.length < 10) {
+            noIdLookalikes.push(
+              "row " + (rowOffset + b) +
+                ": id=" + describeCell(id) +
+                ", category=" + describeCell(noIdColumns.category[b][0]) +
+                ", date=" + describeCell(noIdColumns.date && noIdColumns.date[b][0]) +
+                ", amount=" + describeCell(noIdColumns.amount && noIdColumns.amount[b][0])
+            );
+          }
         }
         if (numFound >= numTargets) break;
-        continue;
+        if (isBlankCell(id)) continue;
       }
 
       // hasOwnProperty via Object.prototype, so that an id colliding with an
@@ -657,6 +723,16 @@ function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
 
     rowOffset += batchSize;
   }
+
+  pendingNoId.forEach(function (stand) {
+    var want = noIdRows[stand];
+    Logger.log(
+      "Could not find the row with no Transaction ID for " + stand + " (" +
+        JSON.stringify(want.original_description) + ", " + want.date + ", " +
+        want.amount + "). Rows with that Full Description that did not match:"
+    );
+    Logger.log(noIdLookalikes.length ? noIdLookalikes.join("\n") : "(none)");
+  });
 
   if (numFound === 0) {
     Logger.log("No matching transactions found to update.");

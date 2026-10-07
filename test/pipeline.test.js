@@ -763,3 +763,58 @@ test("Jev's matches are written before Gemini is called, then Gemini's in a seco
     ]
   );
 });
+
+function noIdRun(sheetRows, gvizRow, extra) {
+  const { sheet, spreadsheet } = noIdSetup(sheetRows);
+  Object.assign(spreadsheet, (extra && extra.spreadsheet) || {});
+  const loaded = loadScripts(SOURCES, {
+    spreadsheet,
+    scriptProperties: { GCP_PROJECT_ID: "proj" },
+    fetch: (url) => {
+      if (url.includes("/gviz/")) return { getContentText: () => gvizResponse([gvizRow]) };
+      return geminiResponse([
+        { transaction_id: "no-id-1", updated_description: "Krispy Kreme", category: "Restaurants" },
+      ]);
+    },
+  });
+  if (extra && extra.formatDate) loaded.context.Utilities.formatDate = extra.formatDate;
+  loaded.context.categorizeUncategorizedTransactions();
+  return { sheet, logs: loaded.logs };
+}
+
+test("a row with no id still matches through stray spaces, blank-looking cells and extra decimals", () => {
+  const { sheet } = noIdRun(
+    [[new Date(2023, 8, 25), "", " ", -19.990000001, "  Krispy  Kreme ", "  ", ""]],
+    [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"]
+  );
+  assert.strictEqual(sheet.data[sheet.data.length - 1][2], "Restaurants");
+});
+
+test("dates from the sheet are read in the spreadsheet's time zone", () => {
+  // The script's zone puts the cell on the 24th; the spreadsheet's on the 25th.
+  const { sheet } = noIdRun(
+    [[new Date(2023, 8, 24, 21), "", "", -19.99, "Krispy Kreme", "", ""]],
+    [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"],
+    {
+      spreadsheet: { getSpreadsheetTimeZone: () => "America/New_York" },
+      formatDate: (d, zone, fmt) => {
+        assert.strictEqual(zone, "America/New_York");
+        assert.strictEqual(fmt, "yyyy-MM-dd");
+        return "2023-09-25";
+      },
+    }
+  );
+  assert.strictEqual(sheet.data[sheet.data.length - 1][2], "Restaurants");
+});
+
+test("when a row with no id cannot be found, the near misses are logged", () => {
+  const { sheet, logs } = noIdRun(
+    [[new Date(2023, 8, 25), "", "", -20.5, "Krispy Kreme", "", ""]],
+    [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"]
+  );
+  assert.strictEqual(sheet.writes.length, 0);
+  const at = logs.findIndex((l) => typeof l === "string" && l.startsWith("Could not find the row"));
+  assert.ok(at !== -1, "expected a could-not-find line");
+  assert.match(logs[at], /no-id-1 \("Krispy Kreme", 2023-09-25, -19\.99\)/);
+  assert.match(logs[at + 1], /^row \d+: id="" \(string\), category="" \(string\), date=".*" \(date\), amount=-20\.5 \(number\)$/);
+});
