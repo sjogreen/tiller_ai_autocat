@@ -14,7 +14,7 @@ Apps Script code to use Gemini to automatically categorize financial transaction
 ## How it works
 
 Each run works through transactions that have a Full Description and no Category
-in batches of up to 50, writing each batch's results before starting the next.
+in batches of up to 400, writing each batch's results before starting the next.
 It keeps going while another batch is expected to finish within 5 minutes
 (Apps Script stops a run at 6), so a large backlog may take a few runs; the log
 says when it stopped early.  The steps below happen for each batch.
@@ -31,14 +31,14 @@ get an ID, and only their Transaction ID cell is written.
    This runs inside the sheet and sends nothing anywhere.
 2. **Jev (optional).** If the `OPENROUTER_API_KEY` script property is set, each
    transaction that has previous transactions is sent to TypeSafe's Jev
-   (`typesafe/jev-1.13`) through OpenRouter, 8 at a time.  Jev picks the previous
+   (`typesafe/jev-1.13`) through OpenRouter, 32 at a time.  Jev picks the previous
    transaction that is the same merchant or recurring payment, or "none".  When
    it picks one with at most a 50% chance of "none", that transaction's
    Description and Category are copied and Gemini is not asked about it.  A pick
    whose category is your FALLBACK_CATEGORY is ignored.
 3. **Gemini.** Everything Jev did not settle (or everything, without the key) goes to
-   Gemini on Vertex AI in one request, with temperature 0, minimal thinking and
-   a fixed JSON response schema.  It returns a cleaned description and a category
+   Gemini on Vertex AI, up to 50 transactions to a request and 3 requests at a
+   time, with temperature 0, low thinking and a fixed JSON response schema.  It returns a cleaned description and a category
    for each, or declines, which is written as FALLBACK_CATEGORY.
 
 **What is sent.**  Only these fields, and nothing else from your sheet (no account

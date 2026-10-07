@@ -139,20 +139,22 @@ function run({ openRouterKey, jev, gemini, newRows, headers }) {
           getContentText: () => gvizResponse(newRows || NEW_ROWS),
         };
       }
-      if (url.includes("aiplatform.googleapis.com")) {
-        const request = JSON.parse(params.payload);
-        calls.gemini.push({ url, request, params });
-        return gemini(request);
-      }
       throw new Error("Unexpected fetch " + url);
     },
-    fetchAll: (requests) =>
-      requests.map((r) => {
+    fetchAll: (requests) => {
+      calls.fetchAllSizes = (calls.fetchAllSizes || []).concat([requests.length]);
+      return requests.map((r) => {
+        if (r.url.includes("aiplatform.googleapis.com")) {
+          const request = JSON.parse(r.payload);
+          calls.gemini.push({ url: r.url, request, params: r });
+          return gemini(request);
+        }
         assert.strictEqual(r.url, "https://openrouter.ai/api/alpha/decisions");
         const request = JSON.parse(r.payload);
         calls.jev.push({ request, headers: r.headers });
         return jev(request);
-      }),
+      });
+    },
   });
 
   context.categorizeUncategorizedTransactions();
@@ -426,9 +428,9 @@ test("Jev picks are still written when the Gemini call fails", () => {
   assert.strictEqual(written.N3, undefined);
 });
 
-test("Jev requests go out at most eight at a time", () => {
+test("Jev requests go out at most 32 at a time", () => {
   const many = [];
-  for (let i = 0; i < 19; i++) {
+  for (let i = 0; i < 70; i++) {
     many.push(["M" + i, "SAFEWAY #" + (2000 + i) + " SAN FRANCISCO CA", -1, "Date(2026,9,1)"]);
   }
   const batchSizes = [];
@@ -454,7 +456,7 @@ test("Jev requests go out at most eight at a time", () => {
     },
   });
   context.categorizeUncategorizedTransactions();
-  assert.deepStrictEqual(batchSizes, [8, 8, 3]);
+  assert.deepStrictEqual(batchSizes, [32, 32, 6]);
 });
 
 // --- Choosing previous transactions by amount -------------------------------
@@ -706,11 +708,16 @@ function liveRun(sheetRows, geminiAnswer, runOptions, extra) {
   });
   let flushed = false;
   const geminiCalls = [];
+  const geminiGroups = [];
   const col = (name) => HEADERS.indexOf(name);
   const loaded = loadScripts(SOURCES, {
     spreadsheet,
     scriptProperties: { GCP_PROJECT_ID: "proj" },
     onFlush: () => (flushed = true),
+    fetchAll: (requests) => {
+      geminiGroups.push(requests.length);
+      return requests.map((r) => loaded.sandbox.UrlFetchApp.fetch(r.url, r));
+    },
     fetch: (url, params) => {
       if (url.includes("/gviz/")) {
         const idWrites = sheet.writes.filter((w) => w.column === "Transaction ID");
@@ -718,7 +725,7 @@ function liveRun(sheetRows, geminiAnswer, runOptions, extra) {
         const rows = sheet.data
           .slice(1)
           .filter((r) => r[col("Full Description")] !== "" && r[col("Category")] === "")
-          .slice(0, 50)
+          .slice(0, 400)
           .map((r) => [
             r[col("Transaction ID")] === "" ? null : r[col("Transaction ID")],
             r[col("Full Description")],
@@ -729,12 +736,14 @@ function liveRun(sheetRows, geminiAnswer, runOptions, extra) {
       }
       const payload = JSON.parse(JSON.parse(params.payload).contents[0].parts[0].text);
       geminiCalls.push(payload.transactions.map((t) => t.transaction_id));
-      if (extra && extra.geminiFails) return response(500, { error: { message: "down" } });
+      if (extra && extra.geminiFails && extra.geminiFails(geminiCalls.length)) {
+        return response(500, { error: { message: "down" } });
+      }
       return geminiResponse(payload.transactions.map(geminiAnswer));
     },
   });
   loaded.context.categorizeUncategorizedTransactions(runOptions);
-  return { sheet, logs: loaded.logs, geminiCalls };
+  return { sheet, logs: loaded.logs, geminiCalls, geminiGroups };
 }
 
 test("a row with no Transaction ID is given one, sent with it, and written back", () => {
@@ -775,10 +784,10 @@ test("only rows about to be sent get an id; categorized rows and rows with ids a
 });
 
 test("a row past the first batch gets its id only when its own batch starts", () => {
-  // 50 uncategorized rows that already have ids come first, so the id-less row
+  // 400 uncategorized rows that already have ids come first, so the id-less row
   // after them is not in the first batch; it is given an id for the second.
   const rows = HISTORY.map((r) => r.slice());
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 400; i++) {
     rows.push([new Date(2023, 8, 25), "", "", -1, "ROW " + i, "ID" + i, ""]);
   }
   rows.push([new Date(2023, 8, 25), "", "", -1, "LATER NO ID", "", ""]);
@@ -792,8 +801,8 @@ test("a row past the first batch gets its id only when its own batch starts", ()
   const assigned = strings.findIndex((l) => l.startsWith("Assigned a Transaction ID to 1 row(s)"));
   const batch2 = strings.indexOf("--- Batch 2 ---");
   assert.ok(batch1Write < assigned && assigned < batch2);
-  assert.strictEqual(geminiCalls.length, 2);
-  assert.strictEqual(geminiCalls[1].length, 1);
+  assert.strictEqual(geminiCalls.length, 9); // 8 requests for batch 1, 1 for batch 2
+  assert.deepStrictEqual(geminiCalls[8].length, 1);
   assert.match(sheet.data[sheet.data.length - 1][HEADERS.indexOf("Transaction ID")], /^autocat:/);
 });
 
@@ -813,28 +822,38 @@ const answerAll = (t) => ({
   category: "Restaurants",
 });
 
+test("a batch's Gemini rows go 50 to a request, three requests at a time", () => {
+  const { geminiCalls, geminiGroups } = liveRun(manyRows(380), answerAll);
+  assert.deepStrictEqual(
+    geminiCalls.map((c) => c.length),
+    [50, 50, 50, 50, 50, 50, 50, 30]
+  );
+  assert.deepStrictEqual(geminiGroups, [3, 3, 2]);
+});
+
 test("a run works through several batches until nothing is left", () => {
-  const { sheet, geminiCalls, logs } = liveRun(manyRows(120), answerAll);
-  assert.deepStrictEqual(geminiCalls.map((c) => c.length), [50, 50, 20]);
+  const { sheet, geminiCalls, logs } = liveRun(manyRows(900), answerAll);
+  assert.strictEqual(geminiCalls.length, 8 + 8 + 2);
+  assert.ok(geminiCalls.every((c) => c.length <= 50));
   const cat = HEADERS.indexOf("Category");
   assert.strictEqual(sheet.data.slice(1).filter((r) => r[cat] === "").length, 0);
-  assert.ok(logs.some((l) => typeof l === "object" && l.batches === 3 && l.answersWritten === 120));
+  assert.ok(logs.some((l) => typeof l === "object" && l.batches === 3 && l.answersWritten === 900));
 });
 
 test("a run stops starting batches when the next would overrun the time budget", () => {
-  // Each batch takes 100s on this clock; with a 250s budget, after two batches
-  // (200s) another would end at 300s, so the run stops.
+  // Each 400-row batch takes 100s on this clock; with a 250s budget, after two
+  // batches (200s) another would end at 300s, so the run stops.
   let clock = 0;
   const now = () => clock;
-  const { geminiCalls, logs } = liveRun(
-    manyRows(200),
+  const { logs } = liveRun(
+    manyRows(1000),
     (t) => {
-      clock += 100000 / 50;
+      clock += 100000 / 400;
       return answerAll(t);
     },
     { budgetMs: 250000, now }
   );
-  assert.strictEqual(geminiCalls.length, 2);
+  assert.strictEqual(logs.filter((l) => typeof l === "string" && l.startsWith("--- Batch")).length, 2);
   assert.ok(logs.includes("Stopping before batch 3 to stay within 250s; run again for the rest."));
 });
 
@@ -846,24 +865,34 @@ test("the default budget is five minutes, and a trigger's event object is ignore
   assert.strictEqual(geminiCalls.length, 1);
 });
 
-test("a run stops when Gemini fails rather than retrying the same rows", () => {
-  const { geminiCalls, logs } = liveRun(manyRows(120), answerAll, undefined, { geminiFails: true });
-  assert.strictEqual(geminiCalls.length, 1);
+test("when one Gemini request fails, the others are written and the run stops", () => {
+  // The second of three requests fails.
+  const { sheet, geminiCalls, logs } = liveRun(manyRows(700), answerAll, undefined, {
+    geminiFails: (n) => n === 2,
+  });
+  assert.strictEqual(geminiCalls.length, 8); // batch 1 only
+  const cat = HEADERS.indexOf("Category");
+  const full = HEADERS.indexOf("Full Description");
+  const written = sheet.data
+    .slice(1)
+    .filter((r) => String(r[full]).startsWith("ROW ") && r[cat] === "Restaurants").length;
+  assert.strictEqual(written, 350);
+  assert.ok(logs.includes("1 of 8 Gemini request(s) failed."));
   assert.ok(logs.includes("Stopping: the Gemini call failed."));
 });
 
 test("rows that cannot be written are not sent again in the same run", () => {
   // Gemini answers with ids that are not on the sheet, so nothing is written
-  // and the same 50 rows come back from the query.
-  const { geminiCalls, logs } = liveRun(manyRows(60), (t) => ({
+  // and the same rows come back from the query.
+  const { geminiCalls, logs } = liveRun(manyRows(450), (t) => ({
     transaction_id: "MISSING-" + t.transaction_id,
     updated_description: "x",
     category: "Restaurants",
   }));
-  assert.deepStrictEqual(geminiCalls.map((c) => c.length), [50]);
+  assert.strictEqual(geminiCalls.length, 8); // the first 400, once
   assert.ok(
     logs.includes(
-      "50 uncategorized transaction(s) were already tried in this run and could not be written; stopping."
+      "400 uncategorized transaction(s) were already tried in this run and could not be written; stopping."
     )
   );
 });

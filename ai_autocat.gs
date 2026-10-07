@@ -56,7 +56,10 @@ const JEV_URL = 'https://openrouter.ai/api/alpha/decisions';
 // Gate on that rather than on the pick's own confidence: three previous
 // transactions from one merchant split the probability between them.
 const JEV_TAKE_THRESHOLD = 0.5;
-const JEV_CONCURRENCY = 8;
+// Jev requests in flight at once. Throughput scales linearly to 64 with no rate
+// limiting seen; one transaction per request, since batching several into one
+// request made Jev take noticeably fewer matches.
+const JEV_CONCURRENCY = 32;
 const JEV_NONE = 'none';
 const JEV_NONE_OPTION =
   'No previous transaction is the same merchant or the same recurring payment as this one';
@@ -97,7 +100,13 @@ const AMOUNT_COL_NAME = "Amount";
 const FALLBACK_CATEGORY = "To Be Categorized";
 
 // Other Misc Paramaters
-const MAX_BATCH_SIZE = 50;
+// Rows per batch. Each batch's leftover rows (those Jev does not settle) go to
+// Gemini at most GEMINI_ROWS_PER_REQUEST to a request, GEMINI_CONCURRENCY
+// requests at a time. Accuracy is flat from 25 to 225 rows a request; 50 keeps
+// each request near 20 seconds.
+const MAX_BATCH_SIZE = 400;
+const GEMINI_ROWS_PER_REQUEST = 50;
+const GEMINI_CONCURRENCY = 3;
 // A run keeps starting batches only while the next is expected to finish within
 // this. Apps Script stops a run at 6 minutes; this leaves a minute to spare.
 const RUN_TIME_BUDGET_MS = 5 * 60 * 1000;
@@ -272,16 +281,20 @@ function categorizeBatch(uncategorizedTransactions, categoryList) {
       "Using Gemini (" + GEMINI_MODEL + ") on Vertex AI for " +
         remaining.length + " transaction(s)"
     );
-    byGemini = lookupDescAndCategoryGemini(
+    var gemini = lookupDescAndCategoryGemini(
       remaining,
       getPromptCategories(categoryList)
     );
-    if (byGemini == null) {
-      // Jev's matches are already written; the rest stay uncategorized for the
-      // next run.
-      byGemini = [];
+    byGemini = gemini.answers;
+    if (gemini.failedRequests > 0) {
+      // Jev's matches and the other requests' answers are still written; the
+      // failed requests' rows stay uncategorized for the next run.
+      Logger.log(
+        gemini.failedRequests + " of " + gemini.requests + " Gemini request(s) failed."
+      );
       geminiFailed = true;
-    } else {
+    }
+    if (byGemini.length > 0) {
       Logger.log(
         "Gemini returned the following sugested categories and descriptions:"
       );
@@ -1229,6 +1242,14 @@ function geminiPayload(transactionList, promptCategories) {
   };
 }
 
+/**
+ * Asks Gemini on Vertex AI for a description and category for each
+ * transaction: GEMINI_ROWS_PER_REQUEST to a request, GEMINI_CONCURRENCY
+ * requests at a time. A request that fails is logged and its rows are left
+ * out; the rest still come back.
+ *
+ * @returns {{answers: Array, failedRequests: number, requests: number}}
+ */
 function lookupDescAndCategoryGemini(transactionList, promptCategories) {
   const projectId = PropertiesService.getScriptProperties().getProperty(
     GCP_PROJECT_ID_PROPERTY
@@ -1242,9 +1263,63 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories) {
         "Project Settings -> Script Properties and add it, using your Google " +
         "Cloud project ID as the value. See the README for full setup steps."
     );
-    return null;
+    return { answers: [], failedRequests: 1, requests: 0 };
   }
 
+  // Regional endpoints are prefixed with the region; the 'global' endpoint is not.
+  const host =
+    GCP_LOCATION == "global"
+      ? "aiplatform.googleapis.com"
+      : GCP_LOCATION + "-aiplatform.googleapis.com";
+
+  const url =
+    "https://" +
+    host +
+    "/v1/projects/" +
+    projectId +
+    "/locations/" +
+    GCP_LOCATION +
+    "/publishers/google/models/" +
+    GEMINI_MODEL +
+    ":generateContent";
+
+  const chunks = [];
+  for (var at = 0; at < transactionList.length; at += GEMINI_ROWS_PER_REQUEST) {
+    chunks.push(transactionList.slice(at, at + GEMINI_ROWS_PER_REQUEST));
+  }
+
+  var answers = [];
+  var failedRequests = 0;
+
+  for (var g = 0; g < chunks.length; g += GEMINI_CONCURRENCY) {
+    var group = chunks.slice(g, g + GEMINI_CONCURRENCY);
+    var startTime = new Date().getTime();
+    var responses = UrlFetchApp.fetchAll(
+      group.map(function (chunk) {
+        return geminiFetchRequest(url, chunk, promptCategories);
+      })
+    );
+    var elapsedTime = new Date().getTime() - startTime;
+
+    for (var i = 0; i < group.length; i++) {
+      var parsed = parseGeminiResponse(responses[i], group[i].length, elapsedTime);
+      if (parsed === null) {
+        failedRequests++;
+      } else {
+        answers = answers.concat(parsed);
+      }
+    }
+  }
+
+  return {
+    answers: answers,
+    failedRequests: failedRequests,
+    requests: chunks.length,
+  };
+}
+
+// One Vertex AI generateContent request, in UrlFetchApp.fetchAll's form.
+function geminiFetchRequest(url, transactionList, promptCategories) {
   const request = {
     systemInstruction: {
       parts: [{ text: GEMINI_SYSTEM_PROMPT }],
@@ -1266,8 +1341,9 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories) {
     },
   };
 
-  const options = {
-    method: "POST",
+  return {
+    url: url,
+    method: "post",
     contentType: "application/json",
     // Application Default Credentials: this token belongs to whoever is running
     // the script, and Vertex AI checks their IAM role on GCP_PROJECT_ID.
@@ -1275,28 +1351,11 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories) {
     payload: JSON.stringify(request),
     muteHttpExceptions: true,
   };
+}
 
-  // Regional endpoints are prefixed with the region; the 'global' endpoint is not.
-  const host =
-    GCP_LOCATION == "global"
-      ? "aiplatform.googleapis.com"
-      : GCP_LOCATION + "-aiplatform.googleapis.com";
-
-  const url =
-    "https://" +
-    host +
-    "/v1/projects/" +
-    projectId +
-    "/locations/" +
-    GCP_LOCATION +
-    "/publishers/google/models/" +
-    GEMINI_MODEL +
-    ":generateContent";
-
-  const startTime = new Date().getTime();
-  const response = UrlFetchApp.fetch(url, options);
-  const elapsedTime = new Date().getTime() - startTime;
-
+// Reads one Vertex AI response: the suggested_transactions array, or null
+// (after logging why) when the request failed or the answer cannot be read.
+function parseGeminiResponse(response, numTransactions, elapsedTime) {
   const responseCode = response.getResponseCode();
   const responseText = response.getContentText();
 
@@ -1307,13 +1366,19 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories) {
     return null;
   }
 
-  const parsedResponse = JSON.parse(responseText);
+  var parsedResponse;
+  try {
+    parsedResponse = JSON.parse(responseText);
+  } catch (e) {
+    Logger.log("Could not read the Vertex AI response: " + responseText.slice(0, 500));
+    return null;
+  }
   if ("error" in parsedResponse) {
     Logger.log("Error from Vertex AI: " + JSON.stringify(parsedResponse.error));
     return null;
   }
 
-  logUsageStats(parsedResponse.usageMetadata, transactionList.length, elapsedTime);
+  logUsageStats(parsedResponse.usageMetadata, numTransactions, elapsedTime);
 
   const candidate = parsedResponse.candidates && parsedResponse.candidates[0];
   const parts = candidate && candidate.content && candidate.content.parts;
@@ -1338,10 +1403,14 @@ function lookupDescAndCategoryGemini(transactionList, promptCategories) {
     .join("");
   const jsonStart = rawText.indexOf("{");
   const jsonEnd = rawText.lastIndexOf("}") + 1; // +1 to include the closing brace
-  const cleanText = rawText.substring(jsonStart, jsonEnd);
 
-  const apiResponse = JSON.parse(cleanText);
-  return apiResponse["suggested_transactions"];
+  try {
+    const apiResponse = JSON.parse(rawText.substring(jsonStart, jsonEnd));
+    return apiResponse["suggested_transactions"] || [];
+  } catch (e) {
+    Logger.log("Could not read Gemini's answer: " + rawText.slice(0, 500));
+    return null;
+  }
 }
 
 function logUsageStats(usage, numTransactions, elapsedTime) {

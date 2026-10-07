@@ -359,12 +359,12 @@ function loadScripts(sources, opts) {
           : (() => {
               throw new Error("Unexpected UrlFetchApp.fetch call to " + url);
             })(),
+      // Without a fetchAll stub, each request goes to the fetch stub, the same
+      // as if it had been fetched on its own.
       fetchAll: (requests) =>
         options.fetchAll
           ? options.fetchAll(requests)
-          : (() => {
-              throw new Error("Unexpected UrlFetchApp.fetchAll call");
-            })(),
+          : requests.map((r) => sandbox.UrlFetchApp.fetch(r.url, r)),
     },
     Utilities: {
       formatString: (fmt, ...args) => {
