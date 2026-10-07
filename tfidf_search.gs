@@ -248,11 +248,18 @@ function createSearchIndex(
   const amounts = amountRange.getValues().flat();
 
   const documents = [];
+  // Optional lookback: rows dated before this are left out of the index. Rows
+  // with no date are kept, since there is nothing to judge them by.
+  const since = options.since instanceof Date ? options.since : null;
 
   // Process each row, skipping those without required category
   for (let i = 0; i < ids.length; i++) {
     // Skip if category is empty or undefined
     if (!categories[i]) {
+      continue;
+    }
+
+    if (since && dates[i] && new Date(dates[i]) < since) {
       continue;
     }
 
@@ -275,6 +282,18 @@ function createSearchIndex(
       options.matchThreshold !== undefined ? options.matchThreshold : 0.25,
     minTermSize: options.minTermSize !== undefined ? options.minTermSize : 3,
   });
+}
+
+/**
+ * The start of the lookback window for previous transactions: midnight,
+ * `days` days before `now`. Matches the 365-day window the Compound pipeline
+ * uses for its precedents.
+ */
+function lookbackStart(days, now) {
+  var start = new Date(now || new Date());
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - days);
+  return start;
 }
 
 /**

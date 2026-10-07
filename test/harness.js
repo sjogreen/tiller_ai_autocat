@@ -356,6 +356,12 @@ function loadScripts(sources, opts) {
           : (() => {
               throw new Error("Unexpected UrlFetchApp.fetch call to " + url);
             })(),
+      fetchAll: (requests) =>
+        options.fetchAll
+          ? options.fetchAll(requests)
+          : (() => {
+              throw new Error("Unexpected UrlFetchApp.fetchAll call");
+            })(),
     },
     Utilities: {
       formatString: (fmt, ...args) => {

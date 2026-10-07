@@ -4,12 +4,51 @@ Apps Script code to use Gemini to automatically categorize financial transaction
 ## About
 - This is a script that is desined to work with the Tiller finance product to automatically categorize and clean up the Description column of your transactions (so you don't have to do it all manually!).
 - It will only touch transactions that don't have a Category set.
-- It works by trying to find how you've previously categorized transactions like the one it's working on, sending those to Gemini on Vertex AI, and asking it to do it's magic.  It will set the Category and Description field based on what comes back.
+- It works by trying to find how you've previously categorized transactions like the one it's working on, sending those to Gemini on Vertex AI, and asking it to do it's magic.  It will set the Category and Description field based on what comes back.  See "How it works" below for the details, including exactly what is sent where.
 - It will pick the best valid category from your Category list, or fall back to a category you specify if it gets confused.
-- There are no API keys to manage.  Calls to Vertex AI are authenticated with Application Default Credentials: `ScriptApp.getOAuthToken()` returns an OAuth token for whoever runs the script, and Vertex AI authorizes it against your Google Cloud project via IAM.
+- There are no API keys to manage for Gemini (the optional Jev stage needs an OpenRouter key).  Calls to Vertex AI are authenticated with Application Default Credentials: `ScriptApp.getOAuthToken()` returns an OAuth token for whoever runs the script, and Vertex AI authorizes it against your Google Cloud project via IAM.
 - If you want to mark transactions that have been modified by this code, add a column to your Transactions sheet called "AI AutoCat" - it will mark transactions it's modified by writing TRUE into this column.
 - Given how sensitive this is to data, any and all feedback about how it's working (or not) is greatly appreciated.
 - Special thanks to [@Aag1024](https://github.com/aag1024) for adding gemini suppport and the tfidf search module which works a lot better than my original hackery.
+
+## How it works
+
+Each run takes up to 50 transactions that have a Full Description and no Category.
+
+1. **Find previous transactions.** For each one, a TF-IDF word-overlap search
+   over the Full Description of your categorized transactions from the last
+   365 days finds up to 6 similar ones.  When more than 6 of the top 20 matches
+   tie exactly on word overlap (every "CHECK #1234" looks alike), the ones
+   closest in amount are chosen instead, the closest of each category first.
+   This runs inside the sheet and sends nothing anywhere.
+2. **Jev (optional).** If the `OPENROUTER_API_KEY` script property is set, each
+   transaction that has previous transactions is sent to TypeSafe's Jev
+   (`typesafe/jev-1.13`) through OpenRouter, 8 at a time.  Jev picks the previous
+   transaction that is the same merchant or recurring payment, or "none".  When
+   it picks one with at most a 50% chance of "none", that transaction's
+   Description and Category are copied and Gemini is not asked about it.  A pick
+   whose category is your FALLBACK_CATEGORY is ignored.
+3. **Gemini.** Everything Jev did not settle (or everything, without the key) goes to
+   Gemini on Vertex AI in one request, with temperature 0, minimal thinking and
+   a fixed JSON response schema.  It returns a cleaned description and a category
+   for each, or declines, which is written as FALLBACK_CATEGORY.
+
+This is the same pipeline, prompt and settings as the Compound categorizer, except
+that categories are sent by name rather than id and there is no bank
+transaction-type hint.
+
+**What is sent.**  Only these fields, and nothing else from your sheet (no account
+names, balances or notes):
+
+| | Jev, via OpenRouter (only with the key) | Gemini, via Vertex AI |
+|---|---|---|
+| Transaction | Full Description, Amount, Date | Transaction ID, Full Description, Amount, Date |
+| Each previous transaction | Full Description, Category, Amount, Date | Full Description, Description, Category, Amount, Date |
+| Categories | - | Every category name, with its Group when the Categories sheet has a Group column |
+
+To turn on the Jev stage, add an `OPENROUTER_API_KEY` script property (Project
+Settings --> Script Properties) holding an OpenRouter API key.  Remove it to go
+back to Gemini only.
 
 ## Demo Video
 - You can see this working with some sample data here: https://drive.google.com/file/d/16ROtqWboSOaNfgKGs0hUSjc3heGqFPBD/view?usp=drive_link
