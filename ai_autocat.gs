@@ -103,8 +103,9 @@ const FALLBACK_CATEGORY = "To Be Categorized";
 // Rows per batch. Each batch's leftover rows (those Jev does not settle) go to
 // Gemini at most GEMINI_ROWS_PER_REQUEST to a request, GEMINI_CONCURRENCY
 // requests at a time. Accuracy is flat from 25 to 225 rows a request; 50 keeps
-// each request near 20 seconds.
-const MAX_BATCH_SIZE = 400;
+// each request near 20 seconds. 250 rows keeps a batch to about a minute even
+// when Gemini answers every row, so several fit in RUN_TIME_BUDGET_MS.
+const MAX_BATCH_SIZE = 250;
 const GEMINI_ROWS_PER_REQUEST = 50;
 const GEMINI_CONCURRENCY = 3;
 // A run keeps starting batches only while the next is expected to finish within

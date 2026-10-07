@@ -15,6 +15,20 @@ const {
 
 const SOURCES = ["gviz.gs", "tfidf_search.gs", "ai_autocat.gs"].map(readWorkingTree);
 
+// Batch sizes as the script defines them, so the batching tests follow the
+// constants rather than repeating them.
+const SETTINGS = (() => {
+  const { context } = loadScripts(SOURCES);
+  const read = (name) => require("vm").runInContext(name, context);
+  return {
+    batch: read("MAX_BATCH_SIZE"),
+    perRequest: read("GEMINI_ROWS_PER_REQUEST"),
+    inFlight: read("GEMINI_CONCURRENCY"),
+  };
+})();
+const B = SETTINGS.batch;
+const requestsFor = (rows) => Math.ceil(rows / SETTINGS.perRequest);
+
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -725,7 +739,7 @@ function liveRun(sheetRows, geminiAnswer, runOptions, extra) {
         const rows = sheet.data
           .slice(1)
           .filter((r) => r[col("Full Description")] !== "" && r[col("Category")] === "")
-          .slice(0, 400)
+          .slice(0, B)
           .map((r) => [
             r[col("Transaction ID")] === "" ? null : r[col("Transaction ID")],
             r[col("Full Description")],
@@ -784,10 +798,11 @@ test("only rows about to be sent get an id; categorized rows and rows with ids a
 });
 
 test("a row past the first batch gets its id only when its own batch starts", () => {
-  // 400 uncategorized rows that already have ids come first, so the id-less row
-  // after them is not in the first batch; it is given an id for the second.
+  // A full batch of uncategorized rows that already have ids comes first, so
+  // the id-less row after them is not in the first batch; it is given an id
+  // for the second.
   const rows = HISTORY.map((r) => r.slice());
-  for (let i = 0; i < 400; i++) {
+  for (let i = 0; i < B; i++) {
     rows.push([new Date(2023, 8, 25), "", "", -1, "ROW " + i, "ID" + i, ""]);
   }
   rows.push([new Date(2023, 8, 25), "", "", -1, "LATER NO ID", "", ""]);
@@ -801,8 +816,8 @@ test("a row past the first batch gets its id only when its own batch starts", ()
   const assigned = strings.findIndex((l) => l.startsWith("Assigned a Transaction ID to 1 row(s)"));
   const batch2 = strings.indexOf("--- Batch 2 ---");
   assert.ok(batch1Write < assigned && assigned < batch2);
-  assert.strictEqual(geminiCalls.length, 9); // 8 requests for batch 1, 1 for batch 2
-  assert.deepStrictEqual(geminiCalls[8].length, 1);
+  assert.strictEqual(geminiCalls.length, requestsFor(B) + 1);
+  assert.deepStrictEqual(geminiCalls[geminiCalls.length - 1].length, 1);
   assert.match(sheet.data[sheet.data.length - 1][HEADERS.indexOf("Transaction ID")], /^autocat:/);
 });
 
@@ -823,32 +838,38 @@ const answerAll = (t) => ({
 });
 
 test("a batch's Gemini rows go 50 to a request, three requests at a time", () => {
-  const { geminiCalls, geminiGroups } = liveRun(manyRows(380), answerAll);
+  assert.deepStrictEqual([SETTINGS.perRequest, SETTINGS.inFlight], [50, 3]);
+  const rows = B - 20; // a partial last request
+  const { geminiCalls, geminiGroups } = liveRun(manyRows(rows), answerAll);
+  const n = requestsFor(rows);
   assert.deepStrictEqual(
     geminiCalls.map((c) => c.length),
-    [50, 50, 50, 50, 50, 50, 50, 30]
+    Array.from({ length: n }, (_, i) => (i < n - 1 ? 50 : rows - 50 * (n - 1)))
   );
-  assert.deepStrictEqual(geminiGroups, [3, 3, 2]);
+  const groups = [];
+  for (let left = n; left > 0; left -= 3) groups.push(Math.min(3, left));
+  assert.deepStrictEqual(geminiGroups, groups);
 });
 
 test("a run works through several batches until nothing is left", () => {
-  const { sheet, geminiCalls, logs } = liveRun(manyRows(900), answerAll);
-  assert.strictEqual(geminiCalls.length, 8 + 8 + 2);
+  const total = 2 * B + 100;
+  const { sheet, geminiCalls, logs } = liveRun(manyRows(total), answerAll);
+  assert.strictEqual(geminiCalls.length, 2 * requestsFor(B) + requestsFor(100));
   assert.ok(geminiCalls.every((c) => c.length <= 50));
   const cat = HEADERS.indexOf("Category");
   assert.strictEqual(sheet.data.slice(1).filter((r) => r[cat] === "").length, 0);
-  assert.ok(logs.some((l) => typeof l === "object" && l.batches === 3 && l.answersWritten === 900));
+  assert.ok(logs.some((l) => typeof l === "object" && l.batches === 3 && l.answersWritten === total));
 });
 
 test("a run stops starting batches when the next would overrun the time budget", () => {
-  // Each 400-row batch takes 100s on this clock; with a 250s budget, after two
+  // Each full batch takes 100s on this clock; with a 250s budget, after two
   // batches (200s) another would end at 300s, so the run stops.
   let clock = 0;
   const now = () => clock;
   const { logs } = liveRun(
-    manyRows(1000),
+    manyRows(4 * B),
     (t) => {
-      clock += 100000 / 400;
+      clock += 100000 / B;
       return answerAll(t);
     },
     { budgetMs: 250000, now }
@@ -867,32 +888,32 @@ test("the default budget is five minutes, and a trigger's event object is ignore
 
 test("when one Gemini request fails, the others are written and the run stops", () => {
   // The second of three requests fails.
-  const { sheet, geminiCalls, logs } = liveRun(manyRows(700), answerAll, undefined, {
+  const { sheet, geminiCalls, logs } = liveRun(manyRows(B + 300), answerAll, undefined, {
     geminiFails: (n) => n === 2,
   });
-  assert.strictEqual(geminiCalls.length, 8); // batch 1 only
+  assert.strictEqual(geminiCalls.length, requestsFor(B)); // batch 1 only
   const cat = HEADERS.indexOf("Category");
   const full = HEADERS.indexOf("Full Description");
   const written = sheet.data
     .slice(1)
     .filter((r) => String(r[full]).startsWith("ROW ") && r[cat] === "Restaurants").length;
-  assert.strictEqual(written, 350);
-  assert.ok(logs.includes("1 of 8 Gemini request(s) failed."));
+  assert.strictEqual(written, B - 50);
+  assert.ok(logs.includes("1 of " + requestsFor(B) + " Gemini request(s) failed."));
   assert.ok(logs.includes("Stopping: the Gemini call failed."));
 });
 
 test("rows that cannot be written are not sent again in the same run", () => {
   // Gemini answers with ids that are not on the sheet, so nothing is written
   // and the same rows come back from the query.
-  const { geminiCalls, logs } = liveRun(manyRows(450), (t) => ({
+  const { geminiCalls, logs } = liveRun(manyRows(B + 50), (t) => ({
     transaction_id: "MISSING-" + t.transaction_id,
     updated_description: "x",
     category: "Restaurants",
   }));
-  assert.strictEqual(geminiCalls.length, 8); // the first 400, once
+  assert.strictEqual(geminiCalls.length, requestsFor(B)); // the first batch, once
   assert.ok(
     logs.includes(
-      "400 uncategorized transaction(s) were already tried in this run and could not be written; stopping."
+      B + " uncategorized transaction(s) were already tried in this run and could not be written; stopping."
     )
   );
 });

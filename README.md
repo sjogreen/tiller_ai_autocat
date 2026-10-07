@@ -14,7 +14,7 @@ Apps Script code to use Gemini to automatically categorize financial transaction
 ## How it works
 
 Each run works through transactions that have a Full Description and no Category
-in batches of up to 400, writing each batch's results before starting the next.
+in batches of up to 250, writing each batch's results before starting the next.
 It keeps going while another batch is expected to finish within 5 minutes
 (Apps Script stops a run at 6), so a large backlog may take a few runs; the log
 says when it stopped early.  The steps below happen for each batch.
