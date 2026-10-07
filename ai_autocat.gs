@@ -122,6 +122,7 @@ function categorizeUncategorizedTransactions() {
     };
     if (txn.amount !== undefined) entry.amount = txn.amount;
     if (txn.date) entry.date = txn.date;
+    if (txn.no_transaction_id) entry.no_transaction_id = true;
     entry.previous_transactions = findSimilarTransactions(
       txn.original_description,
       txn.amount
@@ -203,7 +204,11 @@ function categorizeUncategorizedTransactions() {
   var updatedTransactions = byPrecedent.suggestions.concat(byGemini);
   if (updatedTransactions.length > 0) {
     Logger.log("Writing updated transactions into your sheet...");
-    writeUpdatedTransactions(updatedTransactions, categoryList);
+    var noIdRows = {};
+    transactionList.forEach(function (t) {
+      if (t.no_transaction_id) noIdRows[t.transaction_id] = t;
+    });
+    writeUpdatedTransactions(updatedTransactions, categoryList, noIdRows);
     Logger.log("Finished updating your sheet!");
   }
 }
@@ -231,6 +236,9 @@ function isoDate(value) {
   }
   return String(value);
 }
+
+// Stand-in transaction ids for rows that have none; see getTransactionsToCategorize.
+const NO_ID_PREFIX = "no-id-";
 
 // Gets up to MAX_BATCH_SIZE transactions that have an original description but
 // no category set, as {transaction_id, original_description, amount?, date}.
@@ -282,8 +290,14 @@ function getTransactionsToCategorize() {
     "A:" + lastColLetter
   );
 
-  return uncategorizedTransactions.map(function (row) {
+  return uncategorizedTransactions.map(function (row, i) {
     var txn = { transaction_id: row[0], original_description: row[1] };
+    // Rows added by hand can have no Transaction ID. They get a stand-in id for
+    // this run, and writeUpdatedTransactions finds them by their contents.
+    if (row[0] === null || row[0] === undefined || row[0] === "") {
+      txn.transaction_id = NO_ID_PREFIX + (i + 1);
+      txn.no_transaction_id = true;
+    }
     if (amountAt !== -1 && typeof row[amountAt] === "number") {
       txn.amount = row[amountAt];
     }
@@ -514,7 +528,15 @@ function planCellWrites(cells) {
 // Reads the transaction ID column in batches until every target transaction has
 // been located - new transactions sit at the top of a Tiller sheet, so this
 // usually touches only the first batch - then writes just the cells that change.
-function writeUpdatedTransactions(transactionList, categoryList) {
+//
+// noIdRows (optional) maps the stand-in ids of rows that have no Transaction ID
+// to what was read from them: {original_description, amount?, date}. Such a row
+// is found as the first row with a blank Transaction ID and a blank Category
+// whose Full Description, Date and Amount match (Date and Amount only when they
+// were read). Rows that are identical in all of those get identical answers, so
+// which of them is matched first does not matter.
+function writeUpdatedTransactions(transactionList, categoryList, noIdRows) {
+  noIdRows = noIdRows || {};
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(
     TRANSACTION_SHEET_NAME
   );
@@ -542,10 +564,26 @@ function writeUpdatedTransactions(transactionList, categoryList) {
 
   // Build set of transaction IDs we need to find
   var targetIds = {};
+  var pendingNoId = [];
   for (var i = 0; i < transactionList.length; i++) {
-    targetIds[transactionList[i]["transaction_id"]] = transactionList[i];
+    var targetId = transactionList[i]["transaction_id"];
+    targetIds[targetId] = transactionList[i];
+    if (Object.prototype.hasOwnProperty.call(noIdRows, targetId)) {
+      pendingNoId.push(targetId);
+    }
   }
   var numTargets = transactionList.length;
+
+  // Columns needed only to find rows without a Transaction ID.
+  var fullDescColIdx = headers.indexOf(ORIGINAL_DESCRIPTION_COL_NAME);
+  var dateColIdx = headers.indexOf(DATE_COL_NAME);
+  var amountColIdx = headers.indexOf(AMOUNT_COL_NAME);
+  if (pendingNoId.length > 0 && fullDescColIdx === -1) {
+    pendingNoId = [];
+  }
+  var readColumn = function (colIdx, start, size) {
+    return colIdx === -1 ? null : sheet.getRange(start, colIdx + 1, size, 1).getValues();
+  };
 
   // --- STEP 2: Progressive ID Loading ---
   // Read IDs in batches until we find all target transactions
@@ -559,8 +597,39 @@ function writeUpdatedTransactions(transactionList, categoryList) {
       .getRange(rowOffset, idColIdx + 1, batchSize, 1)
       .getValues();
 
+    var noIdColumns = null;
+    if (pendingNoId.length > 0) {
+      noIdColumns = {
+        fullDesc: readColumn(fullDescColIdx, rowOffset, batchSize),
+        category: readColumn(catColIdx, rowOffset, batchSize),
+        date: readColumn(dateColIdx, rowOffset, batchSize),
+        amount: readColumn(amountColIdx, rowOffset, batchSize),
+      };
+    }
+
     for (var b = 0; b < idBatch.length; b++) {
       var id = idBatch[b][0];
+
+      if (id === "" && noIdColumns && noIdColumns.category[b][0] === "") {
+        for (var p = 0; p < pendingNoId.length; p++) {
+          var want = noIdRows[pendingNoId[p]];
+          if (
+            noIdColumns.fullDesc[b][0] === want.original_description &&
+            (!want.date || !noIdColumns.date ||
+              isoDate(noIdColumns.date[b][0]) === want.date) &&
+            (want.amount === undefined || !noIdColumns.amount ||
+              noIdColumns.amount[b][0] === want.amount)
+          ) {
+            foundRows[pendingNoId[p]] = rowOffset + b;
+            pendingNoId.splice(p, 1);
+            numFound++;
+            break;
+          }
+        }
+        if (numFound >= numTargets) break;
+        continue;
+      }
+
       // hasOwnProperty via Object.prototype, so that an id colliding with an
       // inherited member name cannot produce a false match.
       if (

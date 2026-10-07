@@ -653,3 +653,85 @@ test("each Jev answer is logged with its choice, match probability and confidenc
     },
   ]);
 });
+
+// --- Rows with no Transaction ID --------------------------------------------
+
+function noIdSetup(extraRows) {
+  const rows = HISTORY.map((r) => r.slice()).concat(extraRows);
+  const sheet = new FakeSheet("Transactions", HEADERS, rows);
+  const spreadsheet = new FakeSpreadsheet({
+    Transactions: sheet,
+    Categories: new FakeSheet("Categories", ["Category", "Group"], CATEGORIES),
+  });
+  return { sheet, spreadsheet };
+}
+
+test("a row with no Transaction ID is found by its contents and written", () => {
+  const krispy = (date, amount, category, id) =>
+    [date, "", category, amount, "Krispy Kreme", id, ""];
+  const { sheet, spreadsheet } = noIdSetup([
+    // Look-alikes that must not be touched: already categorized, a different
+    // amount, a different date, and one that has an id.
+    krispy(new Date(2023, 8, 25), -19.99, "Restaurants", ""),
+    krispy(new Date(2023, 8, 25), -5.0, "", ""),
+    krispy(new Date(2023, 8, 26), -19.99, "", ""),
+    krispy(new Date(2023, 8, 25), -19.99, "", "HAS-ID"),
+    // The one gviz returned.
+    krispy(new Date(2023, 8, 25), -19.99, "", ""),
+  ]);
+  const geminiCalls = [];
+  const { context, logs } = loadScripts(SOURCES, {
+    spreadsheet,
+    scriptProperties: { GCP_PROJECT_ID: "proj" },
+    fetch: (url, params) => {
+      if (url.includes("/gviz/")) {
+        return { getContentText: () => gvizResponse([[null, "Krispy Kreme", -19.99, "Date(2023,8,25)"]]) };
+      }
+      const request = JSON.parse(params.payload);
+      geminiCalls.push(request);
+      const id = JSON.parse(request.contents[0].parts[0].text).transactions[0].transaction_id;
+      return geminiResponse([{ transaction_id: id, updated_description: "Krispy Kreme", category: "Restaurants" }]);
+    },
+  });
+  context.categorizeUncategorizedTransactions();
+
+  const sent = JSON.parse(geminiCalls[0].contents[0].parts[0].text).transactions[0];
+  assert.strictEqual(sent.transaction_id, "no-id-1");
+
+  const lastRow = sheet.data.length; // 1-based row of the target
+  const touched = [...new Set(sheet.writes.map((w) => w.row))];
+  assert.deepStrictEqual(touched, [lastRow]);
+  assert.strictEqual(sheet.data[lastRow - 1][HEADERS.indexOf("Category")], "Restaurants");
+  assert.ok(logs.includes("Found 1 of 1 transactions in first " + (lastRow - 1) + " rows."));
+});
+
+test("two identical rows with no Transaction ID are each written once", () => {
+  const row = () => [new Date(2023, 8, 25), "", "", -19.99, "Krispy Kreme", "", ""];
+  const { sheet, spreadsheet } = noIdSetup([row(), row()]);
+  const { context } = loadScripts(SOURCES, {
+    spreadsheet,
+    scriptProperties: { GCP_PROJECT_ID: "proj" },
+    fetch: (url) => {
+      if (url.includes("/gviz/")) {
+        return {
+          getContentText: () =>
+            gvizResponse([
+              [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"],
+              [null, "Krispy Kreme", -19.99, "Date(2023,8,25)"],
+            ]),
+        };
+      }
+      return geminiResponse([
+        { transaction_id: "no-id-1", updated_description: "Krispy Kreme", category: "Restaurants" },
+        { transaction_id: "no-id-2", updated_description: "Krispy Kreme", category: "Restaurants" },
+      ]);
+    },
+  });
+  context.categorizeUncategorizedTransactions();
+  const n = sheet.data.length;
+  assert.deepStrictEqual(
+    [sheet.data[n - 2][2], sheet.data[n - 1][2]],
+    ["Restaurants", "Restaurants"]
+  );
+  assert.strictEqual(new Set(sheet.writes.map((w) => w.a1)).size, sheet.writes.length);
+});
