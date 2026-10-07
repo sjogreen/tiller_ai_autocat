@@ -171,6 +171,19 @@ function categorizeUncategorizedTransactions() {
     }
   }
 
+  // Rows with no Transaction ID are found by their contents when writing.
+  var noIdRows = {};
+  transactionList.forEach(function (t) {
+    if (t.no_transaction_id) noIdRows[t.transaction_id] = t;
+  });
+
+  // Write Jev's answers now, so they are saved even if the Gemini call fails
+  // or the run is cut off.
+  if (byPrecedent.suggestions.length > 0) {
+    Logger.log("Writing Jev's matches into your sheet...");
+    writeUpdatedTransactions(byPrecedent.suggestions, categoryList, noIdRows);
+  }
+
   // Stage 2: Gemini answers for everything Jev did not settle.
   var taken = Object.create(null);
   byPrecedent.suggestions.forEach(function (s) {
@@ -191,7 +204,8 @@ function categorizeUncategorizedTransactions() {
       getPromptCategories(categoryList)
     );
     if (byGemini == null) {
-      // Still write what Jev settled; the rest stay uncategorized for next run.
+      // Jev's matches are already written; the rest stay uncategorized for the
+      // next run.
       byGemini = [];
     } else {
       Logger.log(
@@ -201,14 +215,12 @@ function categorizeUncategorizedTransactions() {
     }
   }
 
-  var updatedTransactions = byPrecedent.suggestions.concat(byGemini);
-  if (updatedTransactions.length > 0) {
-    Logger.log("Writing updated transactions into your sheet...");
-    var noIdRows = {};
-    transactionList.forEach(function (t) {
-      if (t.no_transaction_id) noIdRows[t.transaction_id] = t;
-    });
-    writeUpdatedTransactions(updatedTransactions, categoryList, noIdRows);
+  if (byGemini.length > 0) {
+    Logger.log("Writing Gemini's answers into your sheet...");
+    writeUpdatedTransactions(byGemini, categoryList, noIdRows);
+  }
+
+  if (byPrecedent.suggestions.length > 0 || byGemini.length > 0) {
     Logger.log("Finished updating your sheet!");
   }
 }

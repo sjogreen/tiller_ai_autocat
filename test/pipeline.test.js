@@ -735,3 +735,31 @@ test("two identical rows with no Transaction ID are each written once", () => {
   );
   assert.strictEqual(new Set(sheet.writes.map((w) => w.a1)).size, sheet.writes.length);
 });
+
+// --- Writing after each stage -----------------------------------------------
+
+test("Jev's matches are written before Gemini is called, then Gemini's in a second sweep", () => {
+  const { logs, written } = run({
+    openRouterKey: "or-key",
+    jev: () => jevAnswer("p1", 0.1),
+    gemini: () =>
+      geminiResponse([
+        { transaction_id: "N3", updated_description: "Blue Bottle Coffee", category: "Restaurants" },
+      ]),
+  });
+  assert.ok(written.N1 && written.N2 && written.N3);
+
+  const order = logs.filter((l) => typeof l === "string");
+  const jevWrite = order.indexOf("Writing Jev's matches into your sheet...");
+  const geminiAsk = order.findIndex((l) => l.startsWith("Using Gemini"));
+  const geminiWrite = order.indexOf("Writing Gemini's answers into your sheet...");
+  assert.ok(jevWrite !== -1 && jevWrite < geminiAsk && geminiAsk < geminiWrite);
+  const rows = HISTORY.length + NEW_ROWS.length;
+  assert.deepStrictEqual(
+    order.filter((l) => l.startsWith("Found ") && l.includes(" of ")),
+    [
+      "Found 2 of 2 transactions in first " + rows + " rows.",
+      "Found 1 of 1 transactions in first " + rows + " rows.",
+    ]
+  );
+});
