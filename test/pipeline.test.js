@@ -230,7 +230,7 @@ test("without an OpenRouter key Jev is never called and Gemini gets every row", 
   );
 });
 
-test("Gemini is called with Compound's settings and a strict schema", () => {
+test("Gemini is called with deterministic settings and a strict schema", () => {
   const { calls } = run({ gemini: () => geminiResponse([]) });
   const { request, url } = calls.gemini[0];
   assert.match(url, /publishers\/google\/models\/gemini-3\.8-flash:generateContent$/);
@@ -554,11 +554,10 @@ test("a rent check is shown its rent precedents, not the newest random checks", 
   );
 });
 
-// --- Parity with Compound (web/src/lib/categorizePrepare.unit.spec.ts @ 24735a98) ---
-// Same data and expectations as Compound's tests, run through Tiller's search
-// and closestByAmount with the production settings.
+// --- Choosing previous transactions by amount, end to end through the search ---
+// Real search results fed to closestByAmount with the production settings.
 
-function compoundSearch(context, docs, query, amount) {
+function searchByAmount(context, docs, query, amount) {
   const searcher = new context.TFIDFSearch(
     docs.map((d) => ({
       id: d.id,
@@ -585,7 +584,7 @@ const UNRELATED = [
   "AIRLINE TICKETS", "HARDWARE STORE",
 ].map((rawText, i) => ({ id: "unrelated-" + i, rawText, categoryId: "other", amount: -20 }));
 
-test("parity: shows the matches closest in amount when more tie on the text than there are slots", () => {
+test("shows the matches closest in amount when more tie on the text than there are slots", () => {
   const { context } = loadScripts(SOURCES);
   // const declarations are not properties of the vm context; expose them.
   context.PRECEDENT_CANDIDATES = vmConst(context, "PRECEDENT_CANDIDATES");
@@ -597,15 +596,15 @@ test("parity: shows the matches closest in amount when more tie on the text than
     amount: value,
     date: "2026-0" + (1 + i) + "-02",
   }));
-  const chosen = compoundSearch(context, [...checks, ...UNRELATED], "CHECK #1060", -2850);
+  const chosen = searchByAmount(context, [...checks, ...UNRELATED], "CHECK #1060", -2850);
   assert.deepStrictEqual(chosen.map((x) => x.amount), [-2850, -1020, -880, -620, -455, -40]);
 });
 
-test("parity: keeps the text ranking when the matches do not tie", () => {
+test("keeps the text ranking when the matches do not tie", () => {
   const { context } = loadScripts(SOURCES);
   context.PRECEDENT_CANDIDATES = vmConst(context, "PRECEDENT_CANDIDATES");
   context.EXAMPLES_PER_ROW = vmConst(context, "EXAMPLES_PER_ROW");
-  const chosen = compoundSearch(
+  const chosen = searchByAmount(
     context,
     [
       ...UNRELATED,

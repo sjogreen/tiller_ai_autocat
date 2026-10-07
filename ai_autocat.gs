@@ -35,11 +35,10 @@ const GEMINI_MODEL = 'gemini-3.8-flash'; // Can be any model Vertex AI publishes
 const INPUT_COST_PER_M_TOKENS = 0.75;
 const OUTPUT_COST_PER_M_TOKENS = 3.75;
 
-// Generation settings, matching the Compound categorizer: deterministic output,
-// as little thinking as the model allows, and a ceiling high enough that a full
-// batch is never cut off mid-answer. Compound asks for "minimal" through
-// OpenRouter, but Vertex rejects MINIMAL for gemini-3.8-flash (HTTP 400,
-// "Thinking level is unsupported"), so LOW is the least it accepts here.
+// Generation settings: deterministic output, as little thinking as the model
+// allows, and a ceiling high enough that a full batch is never cut off
+// mid-answer. Vertex rejects MINIMAL for gemini-3.8-flash (HTTP 400, "Thinking
+// level is unsupported"), so LOW is the least it accepts.
 const GEMINI_TEMPERATURE = 0;
 const GEMINI_THINKING_LEVEL = 'LOW';
 const GEMINI_MAX_OUTPUT_TOKENS = 32000;
@@ -541,7 +540,6 @@ function amountDistance(a, b) {
  * exactly on score - every "CHECK #1234" looks the same to word overlap - the
  * tied ones are re-ordered by how close their amount is, the closest of each
  * category is taken first, and any free slots are filled from the same order.
- * Mirrors closestByAmount in Compound's categorizePrepare.ts.
  */
 function closestByAmount(hits, amount, slots) {
   if (hits.length === 0) return [];
@@ -1101,10 +1099,8 @@ function getColumnLetterFromColumnHeader(columnHeaders, columnName) {
   return columnLetter;
 }
 
-// The categorizer prompt, kept in step with Compound's categorize prompt
-// (compound/primitive/alpha/prompts/categorize.toml). Differences: categories
-// are named rather than given ids, and the Plaid transaction-kind hint is left
-// out because a Tiller sheet has no such column.
+// The categorizer prompt. Categories are given by name, and the previous
+// transactions are this sheet's own earlier decisions.
 const GEMINI_SYSTEM_PROMPT = `Act as an API that cleans up bank transaction descriptions and files them into
 a household's own categories. Respond with ONLY JSON.
 

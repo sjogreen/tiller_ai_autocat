@@ -286,8 +286,7 @@ function createSearchIndex(
 
 /**
  * The start of the lookback window for previous transactions: midnight,
- * `days` days before `now`. Matches the 365-day window the Compound pipeline
- * uses for its precedents.
+ * `days` days before `now`.
  */
 function lookbackStart(days, now) {
   var start = new Date(now || new Date());

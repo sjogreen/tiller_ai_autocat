@@ -41,10 +41,6 @@ get an ID, and only their Transaction ID cell is written.
    a fixed JSON response schema.  It returns a cleaned description and a category
    for each, or declines, which is written as FALLBACK_CATEGORY.
 
-This is the same pipeline, prompt and settings as the Compound categorizer, except
-that categories are sent by name rather than id and there is no bank
-transaction-type hint.
-
 **What is sent.**  Only these fields, and nothing else from your sheet (no account
 names, balances or notes):
 
